@@ -414,8 +414,10 @@ impl AirCompiler {
                 .nir_options
                 .map(|options| options.as_ptr().cast_const()),
             max_instructions: MAX_INSTRUCTIONS,
-            // NAK sizes shared memory in 16 bits.
-            max_threadgroup_bytes: limits.max_compute_shared_memory_size.min(u16::MAX.into()),
+            // Each driver reports what its compiler addresses: NVK's 48 KiB
+            // fits NAK's 16 bits, and RADV's and ANV's 64 KiB are Metal's
+            // `maxThreadgroupMemoryLength` there too.
+            max_threadgroup_bytes: limits.max_compute_shared_memory_size,
             max_private_bytes: MAX_PRIVATE_BYTES,
             // The driver reads constant data through a uniform buffer.
             max_constant_bytes: limits.max_uniform_buffer_range,

@@ -1652,9 +1652,10 @@ fn targets_follow_the_device() {
         )
     );
     device.limits.mesh = None;
-    device.limits.max_compute_shared_memory_size = 100 << 10;
+    // A driver's 64 KiB, as RADV's and ANV's, is every byte of it.
+    device.limits.max_compute_shared_memory_size = 64 << 10;
     let target = compiler(&device).target;
-    assert_eq!(target.max_threadgroup_bytes, u16::MAX.into());
+    assert_eq!(target.max_threadgroup_bytes, 64 << 10);
     assert_eq!(target.max_payload_bytes, 0);
 }
 
