@@ -26,13 +26,15 @@
 //! driver's cache data of every kept object and a table of their groups,
 //! units and costs ([`entries::seal`]). The header names a [`Key`]: the build
 //! identity of the compiler that turns NIR into machine code, and the GPU's
-//! vendor, device, driver and pipeline cache UUID. NVK's pipeline cache UUID
-//! is the same for every Stela build (`compat/mesa/build_id.c`), so only the
-//! build identity tells builds apart. Inside the cache NVK keys each shader
-//! by a digest of its serialized NIR, the pipeline state and the layout, so
-//! a function's AIR, constants, formats and linked functions select their
-//! own entries. A store of another key, a damaged one or one past the bound
-//! is reported once and ignored: its pipelines compile again.
+//! vendor, device, driver and pipeline cache UUID. Mesa's drivers derive
+//! their pipeline cache UUID from the build ID, which is the same for every
+//! Stela build (`compat/mesa/build_id.c`), so only the build identity tells
+//! builds apart. Inside the cache NVK and RADV key each shader by a digest
+//! of its serialized NIR (`vk_pipeline_hash_shader_stage`), the pipeline
+//! state and the layout, so a function's AIR, constants, formats and linked
+//! functions select their own entries. A store of another key, a damaged
+//! one or one past the bound is reported once and ignored: its pipelines
+//! compile again.
 use crate::metal::vulkan::physical::Identity;
 use alloc::{sync::Arc, vec::Vec};
 use ash::vk;

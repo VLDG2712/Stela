@@ -22,8 +22,9 @@ use ash::vk::{self, Handle};
 use core::ops::Range;
 
 /// What unmapped memory without a dedicated resource is allocated in
-/// multiples of, so its fill buffers cover it whole; NVK rounds every
-/// allocation to its 4 KiB bind alignment anyway.
+/// multiples of, so its fill buffers cover it whole; the kernel drivers
+/// allocate whole 4 KiB pages anyway (nouveau's bind alignment, amdgpu's
+/// GPU page).
 pub(super) const FILL_ALIGN: u64 = 4096;
 
 /// A buffer over part of a `VkDeviceMemory`, which zero fills write through.

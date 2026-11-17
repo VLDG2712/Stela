@@ -1356,7 +1356,7 @@ impl NativeBackend {
     }
 
     /// The memory type an import of the dma-buf `fd` takes: the first of
-    /// NVK's types for it that prefers coherent memory.
+    /// the driver's types for it that prefers coherent memory.
     fn import_memory_type(&self, fd: i32) -> Result<u32> {
         let bits = self
             .fns
