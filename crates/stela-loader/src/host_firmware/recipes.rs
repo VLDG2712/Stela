@@ -1104,7 +1104,8 @@ pub const GSP: &[Recipe] = &[
 
 mod amdgpu;
 pub use amdgpu::{
-    AMDGPU, AmdGpu, UNPUBLISHED as AMDGPU_UNPUBLISHED, amd_gpu_family, require_amdgpu,
+    AMDGPU, AmdGpu, DiscoveredIp, UNPUBLISHED as AMDGPU_UNPUBLISHED, amd_gpu_family,
+    discovered_may_load, require_amdgpu, require_amdgpu_discovered,
 };
 
 /// The Intel GPU files and their notices: linux-firmware 20261019, whose

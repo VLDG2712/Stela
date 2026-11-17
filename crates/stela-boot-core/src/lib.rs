@@ -10,6 +10,7 @@ pub use stela_contracts::Refusal;
 /// A refused request names the values that decided it.
 pub type Result<T, E = Refusal> = core::result::Result<T, E>;
 
+pub mod amd_discovery;
 pub mod aperture;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;

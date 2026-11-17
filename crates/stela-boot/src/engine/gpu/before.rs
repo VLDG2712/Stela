@@ -49,6 +49,8 @@ pub(super) struct Observed<'a> {
     pub(super) function: &'a mut Function<OwnedConfig>,
     /// The first page of the stack's register BAR, mapped read-only.
     pub(super) registers: &'a Mapping,
+    /// The stack's register BAR, for the reads a stack's part maps itself.
+    pub(super) register_bar: &'a owned::Resource,
 }
 
 /// One stack's part of the claim.
@@ -118,17 +120,23 @@ static NOUVEAU: Before = Before {
 };
 
 /// amdgpu: the files are those it may ask for on the PCI device ID's GPU,
-/// as pinned: its family's for a device its table names, every file named
-/// after an IP version for one it identifies by the device's own IP
-/// discovery table. The driver loads every engine's firmware itself, so
-/// nothing boots by itself after the reset and nothing waits here.
+/// as pinned: its family's for a device its table names; for one it
+/// identifies by the device's own IP discovery table, the files of the
+/// block versions that table names, read here before the reset as amdgpu
+/// reads it ([`ip_discovery`]), or every file named after an IP version
+/// where it cannot be read. The driver loads every engine's firmware
+/// itself, so nothing boots by itself after the reset and nothing waits
+/// here.
 static AMDGPU: Before = Before {
     admits: |adapter, catalog| {
-        on_usb(
-            &amdgpu_files(adapter.device)?,
-            &format!("{:04x}", adapter.device),
-            catalog,
-        )
+        use stela_loader::host_firmware::recipes::AmdGpu;
+        let files = amdgpu_files(adapter.device)?;
+        // A discovered GPU's files are known only from its table, which
+        // `identify` reads; it checks them there.
+        if AmdGpu::of(adapter.device) == AmdGpu::Discovered {
+            return Ok(());
+        }
+        on_usb(&files, &format!("{:04x}", adapter.device), catalog)
     },
     identify: |observed, catalog| {
         use stela_loader::host_firmware::recipes;
@@ -138,8 +146,12 @@ static AMDGPU: Before = Before {
             .registers
             .read32(0)
             .map_err(ServiceError::Mapping)?;
-        let inventory = amdgpu_files(adapter.device)?;
         let name = format!("{:04x}", adapter.device);
+        let inventory = if recipes::AmdGpu::of(adapter.device) == recipes::AmdGpu::Discovered {
+            discovered_files(&observed)?
+        } else {
+            amdgpu_files(adapter.device)?
+        };
         Ok(Identified {
             firmware: select_firmware(&inventory, &name, catalog, None)?,
             identity: None,
@@ -310,6 +322,122 @@ fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
         ServiceError::Refused("amdgpu leaves this GPU to an older driver and loads no files for it")
     })?;
     Ok(inventory)
+}
+
+/// The files amdgpu asks for on the AMD GPU it identifies by its IP
+/// discovery table: those of the block versions the table names, else
+/// every file named after an IP version, with a line saying which.
+fn discovered_files(observed: &Observed<'_>) -> Result<Inventory, ServiceError> {
+    use stela_boot_core::amd_discovery::{self as discovery, Ip};
+    use stela_loader::host_firmware::recipes::{self, DiscoveredIp};
+    let address = observed.adapter.address;
+    let device = observed.adapter.device;
+    let ips = match ip_discovery(observed.services, observed.register_bar) {
+        Ok(ips) => ips,
+        Err(why) => {
+            output::arguments(format_args!(
+                "GPU {address}: its IP discovery table was not read before its reset ({why}); \
+                 its driver is given every firmware file named after an IP version\n"
+            ));
+            return amdgpu_files(device);
+        }
+    };
+    let named: Vec<String> = [
+        ("GC", discovery::GC),
+        ("MP0", discovery::MP0),
+        ("MP1", discovery::MP1),
+        ("SDMA", discovery::SDMA0),
+        ("VCN", discovery::VCN),
+        ("VPE", discovery::VPE),
+        ("DCN", discovery::DMU),
+    ]
+    .iter()
+    .filter_map(|&(block, hw_id)| {
+        discovery::version(&ips, hw_id)
+            .map(|(major, minor, revision)| format!("{block} {major}.{minor}.{revision}"))
+    })
+    .collect();
+    output::arguments(format_args!(
+        "GPU {address}: its IP discovery table names {}; its driver is given those blocks' \
+         firmware\n",
+        named.join(", ")
+    ));
+    let ips: Vec<DiscoveredIp> = ips
+        .iter()
+        .map(
+            |&Ip {
+                 hw_id,
+                 major,
+                 minor,
+                 revision,
+                 ..
+             }| DiscoveredIp {
+                hw_id,
+                major,
+                minor,
+                revision,
+            },
+        )
+        .collect();
+    let mut inventory = Inventory::default();
+    recipes::require_amdgpu_discovered(&mut inventory, device, &ips)
+        .map_err(|_| ServiceError::Refused("the GPU's discovered firmware cannot be selected"))?;
+    Ok(inventory)
+}
+
+/// The IP blocks of the AMD GPU whose register BAR is `registers`, from
+/// its IP discovery table, read before the reset as amdgpu reads it at its
+/// probe ([`stela_boot_core::amd_discovery`]): through the `MM_INDEX` and
+/// `MM_DATA` registers, one dword at a time, whose index is put back after.
+fn ip_discovery(
+    services: &dyn NativeServices,
+    registers: &owned::Resource,
+) -> Result<Vec<stela_boot_core::amd_discovery::Ip>, String> {
+    use stela_boot_core::amd_discovery::{self as discovery, MM_DATA, MM_INDEX, MM_INDEX_HI};
+    if (registers.physical_span().bytes() as usize) < discovery::REGISTER_BYTES {
+        return Err(String::from(
+            "its register BAR is smaller than amdgpu's discovery reads",
+        ));
+    }
+    let read = |offset| read_register(services, registers, offset).unwrap_or(u32::MAX);
+    let mut window = services
+        .authority()
+        .map_err(|error| format!("{error:?}"))?
+        .map(
+            registers.clone(),
+            0,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadWrite,
+        )
+        .map_err(|error| format!("its index registers did not map ({error:?})"))?;
+    let index = (window.read32(MM_INDEX), window.read32(MM_INDEX_HI));
+    let vram = |position: u64| -> u32 {
+        let read = window
+            .write32(MM_INDEX, position as u32 | 0x8000_0000)
+            .and_then(|()| window.write32(MM_INDEX_HI, (position >> 31) as u32))
+            .and_then(|()| window.read32(MM_DATA));
+        read.unwrap_or(u32::MAX)
+    };
+    let result = discovery::place(read, &vram)
+        .map_err(|error| format!("{error:?}"))
+        .and_then(|place| {
+            let mut binary = Vec::new();
+            binary
+                .try_reserve_exact(place.bytes)
+                .map_err(|_| String::from("no memory for the table"))?;
+            for at in (0..place.bytes as u64).step_by(4) {
+                binary.extend_from_slice(&vram(place.offset + at).to_le_bytes());
+            }
+            discovery::parse(&binary).map_err(|error| format!("{error:?}"))
+        });
+    if let (Ok(low), Ok(high)) = index {
+        let _ = window.write32(MM_INDEX, low);
+        let _ = window.write32(MM_INDEX_HI, high);
+    }
+    // SAFETY: the accesses above were this scoped mapping's only use.
+    unsafe { window.retire() }.map_err(|error| format!("{error:?}"))?;
+    result
 }
 
 /// The files xe and the display code ask for on the Intel GPU with PCI

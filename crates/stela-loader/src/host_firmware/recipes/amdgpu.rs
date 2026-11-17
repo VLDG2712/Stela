@@ -190,6 +190,113 @@ fn versioned(name: &str) -> bool {
 #[cfg(test)]
 mod tests;
 
+/// One IP block as the device's IP discovery table lists it: its hardware
+/// ID (`soc15_hw_ip.h`) and version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiscoveredIp {
+    pub hw_id: u16,
+    pub major: u8,
+    pub minor: u8,
+    pub revision: u8,
+}
+
+/// Each block of [`IP_BLOCKS`] named after one block's version, with that
+/// block's hardware ID: graphics (GC), the security processor (MP0), power
+/// management (MP1), DMA (SDMA0), video (VCN), video processing (VPE) and
+/// the display microcontroller (DMU, `amdgpu_dm.c`'s DCN version).
+const BLOCK_IPS: &[(&str, u16)] = &[
+    ("gc", 11),
+    ("psp", 255),
+    ("smu", 1),
+    ("sdma", 42),
+    ("vcn", 12),
+    ("vpe", 21),
+    ("dcn", 271),
+];
+
+/// The media scheduler's file, which `amdgpu_umsch_mm.c` loads for VCN
+/// 4.0.5 and 4.0.6.
+const UMSCH: (&str, u16, &[(u8, u8, u8)]) = ("umsch_mm_4_0_0", 12, &[(4, 0, 5), (4, 0, 6)]);
+
+/// The families only discovery reaches, with the graphics version
+/// amdgpu's discovery gives that family by (`amdgpu_discovery.c`:
+/// GC 10.3.1 is `CHIP_VANGOGH`), whose files then carry its name
+/// (`amdgpu_ucode_legacy_naming`).
+const DISCOVERED_CHIPS: &[(&str, (u8, u8, u8))] = &[("VANGOGH", (10, 3, 1))];
+
+/// The version a file named after a block's version carries: up to three
+/// numbers after `<block>_`, a missing revision being 0
+/// (`dcn_3_5_dmcub.bin` is DCN 3.5.0's).
+fn file_version(rest: &str) -> Option<(u8, u8, u8)> {
+    let rest = rest.strip_suffix(".bin").unwrap_or(rest);
+    let mut numbers = rest.split('_').map_while(|token| token.parse::<u8>().ok());
+    let major = numbers.next()?;
+    let minor = numbers.next()?;
+    Some((major, minor, numbers.next().unwrap_or(0)))
+}
+
+/// Whether amdgpu asks a device whose discovery table lists `ips` for
+/// `member`: a file named after a block's version when the table lists
+/// that block at that version, the media scheduler's for its VCN versions,
+/// and a discovery-only family's files when its graphics version is the
+/// table's.
+pub fn discovered_may_load(ips: &[DiscoveredIp], member: &str) -> bool {
+    let Some(name) = member.strip_prefix("amdgpu/") else {
+        return false;
+    };
+    let listed = |hw_id: u16, version: (u8, u8, u8)| {
+        ips.iter()
+            .any(|ip| ip.hw_id == hw_id && (ip.major, ip.minor, ip.revision) == version)
+    };
+    let (umsch, umsch_ip, umsch_versions) = UMSCH;
+    if named(name, umsch) {
+        return umsch_versions
+            .iter()
+            .any(|&version| listed(umsch_ip, version));
+    }
+    for &(block, hw_id) in BLOCK_IPS {
+        if let Some(rest) = name
+            .strip_prefix(block)
+            .and_then(|rest| rest.strip_prefix('_'))
+            && let Some(version) = file_version(rest)
+        {
+            return listed(hw_id, version);
+        }
+    }
+    DISCOVERED_CHIPS.iter().any(|&(chip, graphics)| {
+        listed(11, graphics)
+            && CHIPS
+                .iter()
+                .find(|(known, _)| *known == chip)
+                .is_some_and(|(_, stems)| stems.iter().any(|stem| named(name, stem)))
+    })
+}
+
+/// Requires the files amdgpu asks for on the AMD GPU with PCI device ID
+/// `device` whose IP discovery table lists `ips`: [`require_amdgpu`] for a
+/// device its table names, which loads its family's files whatever its
+/// discovery table says, else those of [`discovered_may_load`].
+pub fn require_amdgpu_discovered(
+    inventory: &mut Inventory,
+    device: u16,
+    ips: &[DiscoveredIp],
+) -> Result<(), Error> {
+    if AmdGpu::of(device) != AmdGpu::Discovered {
+        return require_amdgpu(inventory, device);
+    }
+    for recipe in AMDGPU
+        .iter()
+        .filter(|recipe| discovered_may_load(ips, recipe.image.member))
+    {
+        inventory.observe(Requirement {
+            name: recipe.image.member,
+            target: TARGET,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
+}
+
 /// The binding amdgpu's files take: Linux's names, as for nouveau's.
 const TARGET: Target<'static> = Target {
     driver: "amdgpu",

@@ -1266,6 +1266,7 @@ fn claim(
             isa_bridges,
             function,
             registers: &registers,
+            register_bar: &resources[registers_at],
         },
         catalog,
     )?;

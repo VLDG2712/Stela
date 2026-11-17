@@ -452,3 +452,120 @@ fn every_legacy_name_is_a_familys() {
         );
     }
 }
+
+/// The files a discovered device with these blocks gets.
+fn discovered(ips: &[(u16, u8, u8, u8)]) -> Vec<&'static str> {
+    let ips: Vec<DiscoveredIp> = ips
+        .iter()
+        .map(|&(hw_id, major, minor, revision)| DiscoveredIp {
+            hw_id,
+            major,
+            minor,
+            revision,
+        })
+        .collect();
+    AMDGPU
+        .iter()
+        .map(|recipe| recipe.image.member)
+        .filter(|member| discovered_may_load(&ips, member))
+        .collect()
+}
+
+#[test]
+fn a_discovered_device_gets_only_its_blocks_versions_files() {
+    // Raphael: GC 10.3.6, PSP and SMU 13.0.5, SDMA 5.2.6, VCN 3.1.2,
+    // DCN 3.1.5.
+    let raphael = discovered(&[
+        (11, 10, 3, 6),
+        (255, 13, 0, 5),
+        (1, 13, 0, 5),
+        (42, 5, 2, 6),
+        (12, 3, 1, 2),
+        (271, 3, 1, 5),
+    ]);
+    for member in [
+        "amdgpu/gc_10_3_6_pfp.bin",
+        "amdgpu/gc_10_3_6_rlc.bin",
+        "amdgpu/psp_13_0_5_toc.bin",
+        "amdgpu/sdma_5_2_6.bin",
+        "amdgpu/vcn_3_1_2.bin",
+        "amdgpu/dcn_3_1_5_dmcub.bin",
+    ] {
+        assert!(raphael.contains(&member), "{member}");
+    }
+    assert!(
+        raphael.iter().all(|member| {
+            [
+                "gc_10_3_6_",
+                "psp_13_0_5_",
+                "smu_13_0_5",
+                "sdma_5_2_6",
+                "vcn_3_1_2",
+                "dcn_3_1_5_",
+            ]
+            .iter()
+            .any(|prefix| member["amdgpu/".len()..].starts_with(prefix))
+        }),
+        "{raphael:?}"
+    );
+    // Strix Point: a two-number DCN name, VPE and the media scheduler.
+    let strix = discovered(&[
+        (11, 11, 5, 0),
+        (255, 14, 0, 0),
+        (42, 6, 1, 0),
+        (12, 4, 0, 5),
+        (21, 6, 1, 0),
+        (271, 3, 5, 0),
+    ]);
+    for member in [
+        "amdgpu/gc_11_5_0_me.bin",
+        "amdgpu/psp_14_0_0_toc.bin",
+        "amdgpu/sdma_6_1_0.bin",
+        "amdgpu/vcn_4_0_5.bin",
+        "amdgpu/vpe_6_1_0.bin",
+        "amdgpu/dcn_3_5_dmcub.bin",
+        "amdgpu/umsch_mm_4_0_0.bin",
+    ] {
+        assert!(strix.contains(&member), "{member}");
+    }
+    assert!(!strix.contains(&"amdgpu/dcn_3_5_1_dmcub.bin"));
+    assert!(!strix.iter().any(|member| member.contains("vangogh")));
+    // Van Gogh's files by its graphics version.
+    let vangogh = discovered(&[(11, 10, 3, 1), (255, 11, 5, 0)]);
+    assert!(vangogh.contains(&"amdgpu/vangogh_pfp.bin"));
+    // A few files, against the superset of every IP-versioned file.
+    assert!(raphael.len() < 30 && strix.len() < 40);
+    assert!(names(AmdGpu::Discovered).len() > 150);
+}
+
+#[test]
+fn every_discovered_file_is_attributed_to_a_block_or_a_family() {
+    // Each file the superset holds is one some discovery table selects, so
+    // narrowing drops none a device could ask for.
+    for member in names(AmdGpu::Discovered) {
+        let name = &member["amdgpu/".len()..];
+        let attributed = BLOCK_IPS.iter().any(|(block, _)| {
+            name.strip_prefix(block)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .and_then(file_version)
+                .is_some()
+        }) || named(name, UMSCH.0)
+            || DISCOVERED_CHIPS.iter().any(|(chip, _)| {
+                CHIPS
+                    .iter()
+                    .find(|(known, _)| known == chip)
+                    .is_some_and(|(_, stems)| stems.iter().any(|stem| named(name, stem)))
+            });
+        assert!(attributed, "{member}");
+    }
+    // Every family only discovery reaches has its graphics version here.
+    for (chip, _) in CHIPS
+        .iter()
+        .filter(|(chip, _)| !DEVICES.iter().any(|(_, named)| named == chip))
+    {
+        assert!(
+            DISCOVERED_CHIPS.iter().any(|(known, _)| known == chip),
+            "{chip}"
+        );
+    }
+}
