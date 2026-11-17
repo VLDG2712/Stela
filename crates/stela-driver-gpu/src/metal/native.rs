@@ -146,6 +146,33 @@ pub struct Refusals {
     pub count: unsafe extern "C" fn(vk::Queue, *mut u32),
 }
 
+/// Whether the driver exports timeline semaphores as file descriptors,
+/// which the guest's completion waits take: a driver whose timelines are
+/// kernel timeline objects can, one that emulates them on binary ones
+/// cannot, and its completions are polled instead.
+///
+/// # Safety
+///
+/// `physical` is a physical device of `instance`.
+unsafe fn exportable_timelines(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+    let mut timeline =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+        .push_next(&mut timeline);
+    let mut properties = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: the caller's guarantee; the chain outlives the call.
+    unsafe {
+        instance.get_physical_device_external_semaphore_properties(physical, &info, &mut properties)
+    };
+    properties
+        .external_semaphore_features
+        .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE)
+        && properties
+            .compatible_handle_types
+            .contains(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+}
+
 /// What a device whose CPU reaches only part of its memory (no Resizable
 /// BAR) costs: textures the CPU copies to and from (`HOST_TRANSFER` images,
 /// Metal's shared and managed textures) must then share the window the
@@ -815,10 +842,13 @@ impl NativeBackend {
         let memories = memory::Memories::new(snapshot.limits.buffer_image_granularity);
         let zeroing = zero::Zeroing::new(snapshot.limits.max_buffer_size, loader.log);
         let exporter: Arc<dyn MemoryExporter> = Arc::from(exporter);
+        // SAFETY: `physical` came from this instance.
+        let exportable = fns.external_semaphore_fd.is_some()
+            && unsafe { exportable_timelines(&instance, physical) };
         let outside = Arc::new(NativeOutside::new(
             device.clone(),
             exporter.clone(),
-            fns.external_semaphore_fd.is_some(),
+            exportable,
             loader.relax,
         ));
         let mut backend = Self {
@@ -2269,12 +2299,11 @@ impl NativeOutside {
     }
 
     /// A timeline semaphore at `initial`, exportable when the device's
-    /// semaphores can be.
+    /// timelines can be ([`exportable_timelines`]).
     fn create_semaphore(&self, initial: u64) -> Result<vk::Semaphore> {
         let mut timeline = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
             .initial_value(initial);
-        // Every timeline can be exported: NVK's are DRM syncobjs either way.
         let mut export = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
         let mut create = vk::SemaphoreCreateInfo::default().push_next(&mut timeline);
@@ -3030,6 +3059,9 @@ impl Backend for NativeBackend {
     }
 
     fn export_semaphore(&mut self, semaphore: Semaphore) -> Option<i32> {
+        if !self.outside.exportable {
+            return None;
+        }
         let fns = self.fns.external_semaphore_fd.as_ref()?;
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(handle(semaphore.0))
