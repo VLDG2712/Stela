@@ -755,3 +755,87 @@ pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
     }
     found
 }
+
+/// The firmware's map of every PCI function ([`stela_boot_core::pci_map`]):
+/// each BAR's memory, each bridge's buses and window, and a copy of each
+/// display function's option ROM the firmware keeps (`RomImage`), as
+/// Linux's EFI stub copies it. The map and the copies are in pages the boot
+/// keeps. An empty region where the firmware lists no PCI function.
+pub(crate) fn firmware_map() -> crate::handoff::Region {
+    use stela_boot_core::pci_map::{self, Function, MOST_FUNCTIONS};
+    let Ok(handles) = boot::find_handles::<PciIo>() else {
+        return crate::handoff::Region::default();
+    };
+    let mut functions = Vec::new();
+    let mut roms = 0;
+    for handle in handles.into_iter().take(MOST_FUNCTIONS) {
+        let Ok(mut pci) = get_protocol::<PciIo>(handle) else {
+            continue;
+        };
+        let (Ok(address), Ok(header)) = (pci.address(), pci.read_header()) else {
+            continue;
+        };
+        let mut spans = Vec::new();
+        for bar in 0..6 {
+            for region in pci.bar_regions(bar).unwrap_or_default() {
+                if region.resource_type == 0 && region.host == region.pci {
+                    spans.push(region.host);
+                }
+            }
+        }
+        let bridge = (header[0x0e] & 0x7f == 1).then(|| {
+            (
+                header[0x19],
+                header[0x1a],
+                u32::from_le_bytes([header[0x20], header[0x21], header[0x22], header[0x23]]),
+            )
+        });
+        let rom = if header[0x0b] == 3 && pci.rom_size != 0 && !pci.rom_image.is_null() {
+            copy_rom(&pci)
+        } else {
+            None
+        };
+        roms += usize::from(rom.is_some());
+        functions.push(Function {
+            segment: address.segment,
+            bus: address.bus,
+            device: address.device,
+            function: address.function,
+            bridge,
+            spans,
+            rom,
+        });
+    }
+    let bytes = pci_map::encode(&functions);
+    let Ok(physical) = crate::firmware::pages(bytes.len().div_ceil(4096)) else {
+        return crate::handoff::Region::default();
+    };
+    // SAFETY: fresh reserved LOADER_DATA pages of at least this length,
+    // written only here; they are never freed or given to a guest.
+    unsafe { core::slice::from_raw_parts_mut(physical as *mut u8, bytes.len()) }
+        .copy_from_slice(&bytes);
+    crate::output::arguments(format_args!(
+        "PCI firmware map: {} functions, {roms} display option ROMs kept\n",
+        functions.len()
+    ));
+    crate::handoff::Region {
+        physical: physical as u64,
+        bytes: bytes.len() as u64,
+    }
+}
+
+/// A copy of the option ROM the firmware read from `pci`'s ROM BAR, in
+/// kept pages, of at most 16 MiB (a ROM BAR decodes no more).
+fn copy_rom(pci: &PciIo) -> Option<Range<u64>> {
+    let length = usize::try_from(pci.rom_size)
+        .ok()
+        .filter(|&length| length <= 16 << 20)?;
+    let physical = crate::firmware::pages(length.div_ceil(4096)).ok()?;
+    // SAFETY: the firmware's live RomImage of RomSize bytes during boot
+    // services, and fresh reserved LOADER_DATA pages of at least that
+    // length, written only here and never freed or given to a guest.
+    unsafe {
+        ptr::copy_nonoverlapping(pci.rom_image.cast::<u8>(), physical as *mut u8, length);
+    }
+    Some(physical as u64..physical as u64 + length as u64)
+}

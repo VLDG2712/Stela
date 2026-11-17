@@ -101,6 +101,10 @@ pub struct Placement {
     /// apart from the function, which Linux keeps as `pci_dev::rom`. Empty
     /// for none. The attach copies it.
     pub rom: &'static [u8],
+    /// The function's expansion ROM BAR where its owner placed it, decoding
+    /// off, which Linux keeps as `PCI_ROM_RESOURCE` for `pci_map_rom`. Size
+    /// 0 for none.
+    pub rom_bar: Region,
 }
 
 /// A function's MSI capability (PCI Local Bus 3.0 6.8.1), one message at most.
@@ -191,9 +195,11 @@ struct RawFunction {
     enroll: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     rom: *const u8,
     rom_length: usize,
+    rom_bar: Region,
 }
 
-const _: () = assert!(size_of::<RawFunction>() == 256);
+const _: () = assert!(size_of::<RawFunction>() == 280);
+const _: () = assert!(core::mem::offset_of!(RawFunction, rom_bar) == 256);
 const _: () = assert!(core::mem::offset_of!(RawFunction, rom_length) == 248);
 const _: () = assert!(core::mem::offset_of!(RawFunction, enroll) == 232);
 const _: () = assert!(core::mem::offset_of!(RawFunction, release_context) == 224);
@@ -870,6 +876,7 @@ impl<H: Host> Attached<H> {
             enroll: catalogued.then_some(enroll::<H>),
             rom: placement.rom.as_ptr(),
             rom_length: placement.rom.len(),
+            rom_bar: placement.rom_bar,
         };
         let mut error = 0;
         // SAFETY: caller's attach contract; C copies the table and returns a

@@ -81,6 +81,7 @@ pub mod paging_controls;
 pub mod panic_region;
 pub mod parking;
 pub mod passthrough;
+pub mod pci_map;
 pub mod pe;
 pub mod pm_timer;
 pub mod poll_timer;
@@ -113,6 +114,7 @@ pub mod tsc;
 pub mod uart;
 pub mod usb_legacy;
 pub mod vfct;
+pub mod video_bios;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
 pub mod work_status;

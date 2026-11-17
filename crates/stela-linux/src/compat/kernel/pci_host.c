@@ -374,6 +374,12 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 		dev->resource[i].end = region->start + region->size - 1;
 		dev->resource[i].flags = region->flags;
 	}
+	if (function->rom_bar.size) {
+		dev->resource[PCI_ROM_RESOURCE].start = function->rom_bar.start;
+		dev->resource[PCI_ROM_RESOURCE].end =
+			function->rom_bar.start + function->rom_bar.size - 1;
+		dev->resource[PCI_ROM_RESOURCE].flags = function->rom_bar.flags;
+	}
 	/* The caller's image lasts only for the attach. */
 	host->function.rom = NULL;
 	if (function->rom_length) {
@@ -783,6 +789,22 @@ int main(void)
 	assert(!stela_linux_pci_rom_map(copy, 1) && !stela_linux_pci_rom_mapped(rom));
 	function.rom = NULL;
 	function.rom_length = 0;
+	/* An expansion ROM BAR the owner placed is PCI_ROM_RESOURCE, which
+	 * pci_enable_rom turns on at its address and pci_disable_rom off. */
+	function.rom_bar = (struct stela_linux_pci_region){
+		0xc0020000, 0x20000, IORESOURCE_MEM | IORESOURCE_READONLY};
+	memcpy(&config[PCI_ROM_ADDRESS], "\x00\x00\x02\xc0", 4);
+	dev = stela_linux_pci_attach(&function, NULL);
+	assert(dev && pci_resource_start(dev, PCI_ROM_RESOURCE) == 0xc0020000);
+	assert(pci_resource_len(dev, PCI_ROM_RESOURCE) == 0x20000);
+	assert(!pci_enable_rom(dev));
+	assert(!pci_read_config_dword(dev, PCI_ROM_ADDRESS, &value) &&
+	       value == (0xc0020000 | PCI_ROM_ADDRESS_ENABLE));
+	pci_disable_rom(dev);
+	assert(!pci_read_config_dword(dev, PCI_ROM_ADDRESS, &value) && value == 0xc0020000);
+	stela_linux_pci_remove_device(dev);
+	function.rom_bar = (struct stela_linux_pci_region){0};
+	memset(&config[PCI_ROM_ADDRESS], 0, 4);
 	/* An atomic final put cannot destroy the host or callback context. */
 	function.release_context = test_release_context;
 	dev = stela_linux_pci_attach(&function, NULL);

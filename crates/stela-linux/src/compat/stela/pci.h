@@ -57,9 +57,14 @@ struct stela_linux_pci_function {
 	 * which the attach copies into pci_dev::rom: rom_length 0 for none. */
 	const void *rom;
 	size_t rom_length;
+	/* The expansion ROM BAR where the owner placed it, decoding off, which
+	 * the attach keeps as PCI_ROM_RESOURCE: size 0 for none. */
+	struct stela_linux_pci_region rom_bar;
 };
 
-_Static_assert(sizeof(struct stela_linux_pci_function) == 256, "Linux PCI function ABI");
+_Static_assert(sizeof(struct stela_linux_pci_function) == 280, "Linux PCI function ABI");
+_Static_assert(__builtin_offsetof(struct stela_linux_pci_function, rom_bar) == 256,
+	       "Linux PCI ROM BAR ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, release_context) == 224,
 	       "Linux PCI context release ABI");
 

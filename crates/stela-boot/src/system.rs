@@ -846,6 +846,9 @@ fn load(
         boot_disk[..take].copy_from_slice(&location.as_bytes()[..take]);
         boot_disk_bytes = take;
     }
+    // Before the firmware's exit, while its PCI bus driver keeps what it
+    // sized and the option ROMs it read.
+    let pci_map = crate::pci_io::firmware_map();
     let (device_skips, device_needs) = device_starts(&system);
     // Found now, through the firmware's own protocol; claimed as the first
     // act after the firmware's exit.
@@ -1057,6 +1060,7 @@ fn load(
             power,
             efi_reset: runtime.reset,
             rsdp: storage::rsdp().unwrap_or(0),
+            pci_map,
             wifi_key: Region {
                 physical: wifi_key.as_ptr() as u64,
                 bytes: wifi_key.len() as u64,

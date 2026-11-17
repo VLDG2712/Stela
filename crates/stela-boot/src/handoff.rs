@@ -98,6 +98,9 @@ pub struct Handoff {
     pub efi_reset: u64,
     /// The firmware's ACPI RSDP; zero without one.
     pub rsdp: u64,
+    /// The firmware's PCI map, with copies of the display functions' option
+    /// ROMs (`pci_io::firmware_map`); empty without one.
+    pub pci_map: Region,
     /// The `--wifi-key` file's bytes, read from the ESP; empty when
     /// `--wifi` names no network or the file could not be read. The engine
     /// parses and wipes them.

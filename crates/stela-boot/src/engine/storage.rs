@@ -2369,7 +2369,10 @@ pub unsafe fn open(
             core::mem::take(&mut devices.pcie_bluetooth),
             root,
         ),
-        gpus: core::mem::take(&mut devices.gpus),
+        gpus: {
+            super::gpu::keep_atrm(devices.atrm.take());
+            core::mem::take(&mut devices.gpus)
+        },
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
         isa_bridges: core::mem::take(&mut devices.isa_bridges),
         usb,

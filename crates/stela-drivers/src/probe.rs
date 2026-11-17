@@ -753,6 +753,11 @@ pub struct Devices {
     /// PCI-to-ISA bridges as their configuration reads, which no driver
     /// here takes: a GPU's kernel driver names the chipset by them.
     pub isa_bridges: Vec<IsaBridge>,
+    /// A hybrid laptop's discrete GPU video BIOS, read through `ATRM` from
+    /// the first display function's ACPI companion that has it, as amdgpu
+    /// reads it (`gpu_methods::atrm`).
+    #[cfg(feature = "native-acpi")]
+    pub atrm: Option<gpu_methods::Atrm>,
     /// Host keyboards and pointers: virtio-input devices, USB HID devices
     /// behind xHCI controllers, and the i8042 ports the ACPI namespace
     /// lists, each polled through [`InputDevice::poll`].
@@ -2309,6 +2314,11 @@ pub unsafe fn probe_observed(
                 .unsupported
                 .push((address, class, d3cold::POWERED_OFF_PORT));
         }
+    }
+    // ATRM, read while the census's bridges name each function's companion.
+    #[cfg(feature = "native-acpi")]
+    if let Some(session) = services.and_then(|services| services.acpi()) {
+        devices.atrm = gpu_methods::atrm(session, &bridges, &devices.classes);
     }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
     // Each display controller's companion, once every bridge above it is

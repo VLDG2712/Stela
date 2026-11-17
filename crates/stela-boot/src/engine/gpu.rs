@@ -184,14 +184,174 @@ pub(super) unsafe fn keep_video_bios_table(rsdp: u64, root: u64) {
     }
 }
 
-/// The function's image in the kept VFCT table, as Linux takes it
-/// (`amdgpu_acpi_vfct_bios`), or nothing; a refused image is said once.
-fn platform_rom(adapter: &gpu::Adapter) -> &'static [u8] {
-    use stela_boot_core::vfct;
+/// The video BIOS a hybrid laptop's `ATRM` handed out during the PCI
+/// census (`stela_drivers::probe::gpu_methods::atrm`).
+static ATRM: AtomicPtr<stela_drivers::probe::gpu_methods::Atrm> = AtomicPtr::new(ptr::null_mut());
+
+/// Keeps what `ATRM` handed out for the claims, with a line.
+pub(super) fn keep_atrm(atrm: Option<stela_drivers::probe::gpu_methods::Atrm>) {
+    let Some(atrm) = atrm else { return };
+    output::arguments(format_args!(
+        "GPU: ATRM at {} on {} handed out {} bytes of video BIOS\n",
+        atrm.path,
+        atrm.owner,
+        atrm.image.len()
+    ));
+    let previous = ATRM.swap(Box::into_raw(Box::new(atrm)), Ordering::AcqRel);
+    if !previous.is_null() {
+        // SAFETY: only this function stores, from `Box::into_raw`, and the
+        // claims read it only after the census that calls this once.
+        drop(unsafe { Box::from_raw(previous) });
+    }
+}
+
+/// The firmware's PCI map and the option ROMs it kept, for the claims.
+struct FirmwareMap {
+    functions: Vec<stela_boot_core::pci_map::Function>,
+    /// Each display function's option ROM, by its place in `functions`.
+    roms: Vec<(usize, Vec<u8>)>,
+}
+
+static FIRMWARE_MAP: AtomicPtr<FirmwareMap> = AtomicPtr::new(ptr::null_mut());
+
+/// Keeps the firmware's PCI map (`pci_io::firmware_map`) and copies of the
+/// option ROMs it names.
+///
+/// # Safety
+/// `root` is the loader root that maps `region` and the copies it names,
+/// pages the boot kept. Called once, before any claim.
+pub(super) unsafe fn keep_pci_map(region: crate::handoff::Region, root: u64) {
+    if region.bytes == 0 {
+        return;
+    }
+    let map = {
+        // SAFETY: the caller's; the loader root maps the kept pages.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        let read = |range: Range<u64>| -> Vec<u8> {
+            // SAFETY: as above: kept pages the boot wrote before its exit.
+            unsafe {
+                core::slice::from_raw_parts(
+                    range.start as *const u8,
+                    (range.end - range.start) as usize,
+                )
+            }
+            .to_vec()
+        };
+        let Some(functions) = stela_boot_core::pci_map::decode(&read(
+            region.physical..region.physical + region.bytes,
+        )) else {
+            output::arguments(format_args!("GPU: the firmware's PCI map is unreadable\n"));
+            return;
+        };
+        let roms = functions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, function)| Some((index, read(function.rom.clone()?))))
+            .collect();
+        FirmwareMap { functions, roms }
+    };
+    FIRMWARE_MAP.store(Box::into_raw(Box::new(map)), Ordering::Release);
+}
+
+fn firmware_map() -> Option<&'static FirmwareMap> {
     // SAFETY: stored once before any claim and never freed.
-    let Some(table) = (unsafe { VIDEO_BIOS_TABLE.load(Ordering::Acquire).as_ref() }) else {
+    unsafe { FIRMWARE_MAP.load(Ordering::Acquire).as_ref() }
+}
+
+/// The function's platform ROM, a video BIOS image firmware publishes
+/// apart from the function, which Linux keeps as `pci_dev::rom` and amdgpu
+/// reads when the places it searches first hold none
+/// (`amdgpu_read_platform_bios`). Linux's own places come in amdgpu's order,
+/// those its ACPI support reads first, as Stela's Linux profile has none:
+/// `ATRM` for a discrete GPU (`amdgpu_atrm_get_bios`), then the `VFCT`
+/// image (`amdgpu_acpi_vfct_bios`), then the option ROM copy the firmware
+/// kept (x86 Linux's `pci_dev::rom` from its EFI stub). One line says which.
+fn platform_rom(adapter: &gpu::Adapter, integrated: bool) -> &'static [u8] {
+    let address = adapter.address;
+    if let Some(image) = atrm_image(adapter, integrated) {
+        return image;
+    }
+    if let Some(image) = vfct_image(adapter) {
+        return image;
+    }
+    let Some(map) = firmware_map() else {
         return &[];
     };
+    let Some((_, image)) = map.roms.iter().find(|(index, _)| {
+        let function = &map.functions[*index];
+        (
+            function.segment,
+            function.bus,
+            function.device,
+            function.function,
+        ) == (
+            address.segment,
+            address.bus,
+            address.device,
+            address.function,
+        )
+    }) else {
+        return &[];
+    };
+    output::arguments(format_args!(
+        "GPU {address}: video BIOS of {} bytes from the option ROM the firmware read, given to \
+         Linux as its platform ROM\n",
+        image.len()
+    ));
+    image
+}
+
+/// `ATRM`'s image for an AMD GPU amdgpu takes as discrete
+/// (`amdgpu_get_bios_dgpu` asks `ATRM` first; its APU path never does):
+/// one its table names and does not flag as an APU, or one it identifies by
+/// discovery whose image names it, as only the probe tells those apart.
+/// Only an ATOM BIOS, as `check_atom_bios` takes one.
+fn atrm_image(adapter: &gpu::Adapter, integrated: bool) -> Option<&'static [u8]> {
+    use stela_boot_core::video_bios;
+    use stela_loader::host_firmware::recipes::AmdGpu;
+    if adapter.vendor != gpu::Vendor::Amd || integrated {
+        return None;
+    }
+    // Whether amdgpu takes it as discrete: yes for one its table names
+    // without the APU flag; unknown before the probe for a discovered one.
+    let discrete = match AmdGpu::of(adapter.device) {
+        AmdGpu::Named(..) => Some(true),
+        AmdGpu::Discovered => None,
+        AmdGpu::LeftToRadeon => return None,
+    };
+    // SAFETY: stored once by the census before any claim and never freed.
+    let atrm = unsafe { ATRM.load(Ordering::Acquire).as_ref() }?;
+    let address = adapter.address;
+    let image = atrm.image.as_slice();
+    let names_it = video_bios::names(image) == Some((0x1002, adapter.device));
+    if !video_bios::atom(image) || (discrete.is_none() && !names_it) {
+        output::arguments(format_args!(
+            "GPU {address}: ATRM's {} bytes at {} are not taken: {}\n",
+            image.len(),
+            atrm.path,
+            if video_bios::atom(image) {
+                "the image names another device and amdgpu decides only at its probe whether this one is discrete"
+            } else {
+                "they are no ATOM BIOS"
+            }
+        ));
+        return None;
+    }
+    output::arguments(format_args!(
+        "GPU {address}: video BIOS of {} bytes from ATRM at {}, given to Linux as its platform \
+         ROM\n",
+        image.len(),
+        atrm.path
+    ));
+    Some(image)
+}
+
+/// The function's image in the kept VFCT table, as Linux takes it
+/// (`amdgpu_acpi_vfct_bios`); a refused image is said once.
+fn vfct_image(adapter: &gpu::Adapter) -> Option<&'static [u8]> {
+    use stela_boot_core::vfct;
+    // SAFETY: stored once before any claim and never freed.
+    let table = unsafe { VIDEO_BIOS_TABLE.load(Ordering::Acquire).as_ref() }?;
     let address = adapter.address;
     let function = vfct::Function {
         bus: address.bus,
@@ -211,16 +371,107 @@ fn platform_rom(adapter: &gpu::Adapter) -> &'static [u8] {
                 "GPU {address}: video BIOS of {} bytes from the ACPI VFCT table, given to Linux as its platform ROM\n",
                 image.bytes.len()
             ));
-            &table[image.bytes]
+            Some(&table[image.bytes])
         }
-        Err(vfct::Error::NoImage) => &[],
+        Err(vfct::Error::NoImage) => None,
         Err(error) => {
             output::arguments(format_args!(
                 "GPU {address}: the ACPI VFCT table's image is refused ({error:?}); the driver looks for its video BIOS elsewhere\n"
             ));
-            &[]
+            None
         }
     }
+}
+
+/// The expansion ROM BAR's register, its enable bit and its address bits.
+const ROM_BAR: u16 = 0x30;
+const ROM_ENABLE: u32 = 1;
+const ROM_ADDRESS: u32 = 0xffff_f800;
+
+/// The function's expansion ROM BAR as Linux's PCI core leaves it for
+/// `pci_map_rom`, decoding off: sized, and kept where firmware assigned it
+/// inside the window above it, else placed in that window clear of every
+/// BAR the firmware sized below it (`stela_boot_core::pci_map::rom_room`),
+/// as Linux assigns an unassigned resource. The region for Linux's
+/// `PCI_ROM_RESOURCE` and its reservation, or `None` with a line where the
+/// function has no ROM BAR or no room is found; the BAR is then put back
+/// as firmware left it.
+fn expansion_rom(
+    services: &dyn NativeServices,
+    function: &mut Function<OwnedConfig>,
+) -> Option<(Region, owned::Resource)> {
+    use stela_boot_core::{pci_map::rom_room, video_bios::rom_size};
+    /// Linux's `IORESOURCE_READONLY` and `IORESOURCE_SIZEALIGN`.
+    const RESOURCE_READONLY: u64 = 0x4000;
+    const RESOURCE_SIZEALIGN: u64 = 0x4_0000;
+    let address = function.address;
+    let config = function.config();
+    let original = config.read32(ROM_BAR).ok()?;
+    // Sized with its decoding off, as `pci_read_bases` sizes it.
+    let read = config
+        .write32(ROM_BAR, ROM_ADDRESS)
+        .and_then(|()| config.read32(ROM_BAR));
+    let put_back = |config: &mut OwnedConfig| config.write32(ROM_BAR, original & !ROM_ENABLE);
+    let Some(size) = read.ok().and_then(rom_size).map(u64::from) else {
+        let _ = put_back(config);
+        return None;
+    };
+    // A ROM smaller than a page takes a page, aligned to it.
+    let span = size.max(PAGE);
+    let claim = |start: u64| {
+        services.bar_resource(
+            address,
+            Bar::Memory {
+                address: start,
+                size: span,
+                prefetchable: false,
+                wide: false,
+            },
+        )
+    };
+    let assigned = u64::from(original & ROM_ADDRESS);
+    let region = |start: u64| Region {
+        start,
+        size,
+        flags: RESOURCE_MEMORY | RESOURCE_PREFETCHABLE | RESOURCE_READONLY | RESOURCE_SIZEALIGN,
+    };
+    // Firmware's place, when it is one: aligned and not the all-ones the
+    // firmware's own sizing left.
+    if assigned != 0
+        && assigned.is_multiple_of(span)
+        && assigned != u64::from(ROM_ADDRESS) & !(size - 1)
+        && let Ok(resource) = claim(assigned)
+    {
+        let _ = put_back(config);
+        output::arguments(format_args!(
+            "GPU {address}: its expansion ROM of {size} bytes stays where firmware placed it, at \
+             {assigned:#x}\n"
+        ));
+        return Some((region(assigned), resource));
+    }
+    let placed = firmware_map()
+        .and_then(|map| rom_room(&map.functions, address.segment, address.bus, span))
+        .filter(|&start| start + span <= 1 << 32);
+    let found = placed.and_then(|start| {
+        let resource = claim(start).ok()?;
+        config.write32(ROM_BAR, start as u32).ok()?;
+        Some((region(start), resource))
+    });
+    match &found {
+        Some((region, _)) => output::arguments(format_args!(
+            "GPU {address}: its expansion ROM of {size} bytes, unassigned by firmware, placed at \
+             {:#x} in the window above it, decoding off, as Linux assigns it\n",
+            region.start
+        )),
+        None => {
+            let _ = put_back(config);
+            output::arguments(format_args!(
+                "GPU {address}: its expansion ROM of {size} bytes has no place in the window above \
+                 it; its driver reads its video BIOS from the other places it searches\n"
+            ));
+        }
+    }
+    found
 }
 
 /// Who runs PE work on the boot CPU, once the PEs run.
@@ -1176,7 +1427,7 @@ fn claim(
         // A mapping past the driver's mask is refused
         // (`function::Mappings`), not truncated.
         dma_limit: stack.kernel.dma_limit(adapter),
-        rom: platform_rom(adapter),
+        rom: platform_rom(adapter, (stack.kernel.integrated)(adapter)),
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
@@ -1346,6 +1597,12 @@ fn claim(
     let mut function = ManuallyDrop::new(bound.requester.into_function());
     if reset {
         resized_bars(address, &function, &mut placement, &mut bars);
+    }
+    // After the reset, which clears what a ROM BAR held.
+    if let Some((region, resource)) = expansion_rom(services, &mut function) {
+        placement.rom_bar = region;
+        bars.push(region.start..region.start + region.size.max(PAGE));
+        resources.push(resource);
     }
     let mut views = ManuallyDrop::new(views);
     views
