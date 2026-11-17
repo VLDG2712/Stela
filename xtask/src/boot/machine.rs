@@ -184,61 +184,6 @@ pub(super) fn attach_display(arguments: &Run, bundle: bool, command: &mut Proces
     }
 }
 
-/// The root port `--vfio-gpu` hangs behind. An explicit slot, past those the
-/// other parts number in order, leaves their addresses as they were.
-const VFIO_PORT: &str = "pcie-root-port,id=host-gpu-port,chassis=1,slot=1,addr=0x1c";
-
-/// `--vfio-gpu`'s functions, the given one first: all of its slot, since
-/// they share a reset and usually an IOMMU group. Each must be vfio-pci's.
-pub(super) fn vfio_functions(function: &str, devices: &Path) -> Result<Vec<String>> {
-    let (slot, _) = function.rsplit_once('.').expect("parsed as a PCI function");
-    let mut functions = Vec::new();
-    for entry in fs::read_dir(devices)? {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        if name
-            .rsplit_once('.')
-            .is_some_and(|(other, _)| other == slot)
-        {
-            let driver = fs::read_link(devices.join(&name).join("driver")).ok();
-            ensure!(
-                driver.as_deref().and_then(Path::file_name) == Some("vfio-pci".as_ref()),
-                "{name} is not bound to vfio-pci: run through xtask/scripts/vfio-gpu.sh"
-            );
-            functions.push(name);
-        }
-    }
-    ensure!(
-        functions.iter().any(|name| name == function),
-        "the host has no PCI function {function}"
-    );
-    functions.sort_by_key(|name| (name != function, name.clone()));
-    Ok(functions)
-}
-
-/// The QEMU devices of `functions`, in one multifunction slot of the port.
-///
-/// No option ROM: Stela drives the card with no firmware help, and a card nothing
-/// has posted since it lost power hangs the firmware in the ROM's GOP driver.
-pub(super) fn vfio_devices(functions: &[String]) -> Vec<String> {
-    let mut devices = vec![VFIO_PORT.to_owned()];
-    devices.extend(functions.iter().enumerate().map(|(index, host)| {
-        let multifunction = if index == 0 { ",multifunction=on" } else { "" };
-        format!("vfio-pci,host={host},bus=host-gpu-port,addr=0.{index},rombar=0{multifunction}")
-    }));
-    devices
-}
-
-/// `--vfio-gpu`'s root port and the card's functions.
-pub(super) fn attach_vfio_gpu(arguments: &Run, command: &mut Process) -> Result<()> {
-    if let Some(function) = &arguments.vfio_gpu {
-        let functions = vfio_functions(function, Path::new("/sys/bus/pci/devices"))?;
-        for device in vfio_devices(&functions) {
-            command.arg("-device").arg(device);
-        }
-    }
-    Ok(())
-}
-
 /// `--host-audio`'s HD Audio controller and codec.
 pub(super) fn attach_audio(arguments: &Run, command: &mut Process) {
     if arguments.host_audio {

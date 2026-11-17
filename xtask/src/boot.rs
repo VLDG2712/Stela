@@ -41,6 +41,7 @@ mod network_check;
 mod preboot;
 mod report;
 mod storage;
+mod vfio;
 
 /// `isa-debug-exit` reports `(code << 1) | 1`; a timeout reports 124.
 const TIMEOUT_EXIT: u8 = 124;
@@ -260,8 +261,9 @@ pub struct Run {
     #[arg(long, value_enum)]
     iommu: Option<Iommu>,
     /// Hand the mount a physical GPU through VFIO: this PCI function of the
-    /// host (such as `0000:01:00.0`) and the other functions of its slot, in
-    /// a slot of their own behind a PCIe root port. The emulated VGA stays as
+    /// host (such as `0000:01:00.0`) and the functions of its slot that
+    /// belong to its GPU (a discrete card's whole slot, an integrated GPU's
+    /// display and HD audio), in a slot of their own behind a PCIe root port. The emulated VGA stays as
     /// the firmware's display, for a card with no monitor; one with a monitor
     /// takes the display. `xtask/scripts/vfio-gpu.sh` binds it for a run.
     #[arg(long, requires = "kvm", conflicts_with = "iommu", value_parser = parse_pci_function)]
@@ -856,7 +858,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
         &mut command,
     );
     machine::attach_display(&arguments, bundle, &mut command);
-    machine::attach_vfio_gpu(&arguments, &mut command)?;
+    vfio::attach(&arguments, &mut command)?;
     machine::attach_audio(&arguments, &mut command);
     network::attach(&arguments, &paths.output, &mut command)?;
     machine::attach_usb(&arguments, &mut command);

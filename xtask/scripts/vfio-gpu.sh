@@ -35,10 +35,37 @@ gpu() {
   die "no NVIDIA display function"
 }
 
-# The functions of the card's slot, which go to the guest together.
+# The functions of the card's slot that go to the guest together, as
+# `cargo xtask boot run --vfio-gpu` lends them: the whole slot when every
+# function in it has the display function's vendor and is one a card carries
+# (display 0x03, HD audio 0x0403, USB-C's USB 0x0c03 and UCSI 0x0c80);
+# otherwise only that vendor's display and HD audio functions. An integrated
+# GPU's slot also holds the platform's USB controllers and security processor,
+# which stay with the host.
 functions() {
-  local device
-  for device in "$devices/${1%.*}".*; do basename "$device"; done
+  local card=$1 device vendor class whole=1 members=()
+  vendor=$(<"$devices/$card/vendor")
+  for device in "$devices/${card%.*}".*; do
+    class=$(<"$device/class")
+    if [[ $(<"$device/vendor") != "$vendor" ]] ||
+      [[ $class != 0x03* && $class != 0x0403* && $class != 0x0c03* && $class != 0x0c80* ]]; then
+      whole=0
+    fi
+  done
+  for device in "$devices/${card%.*}".*; do
+    class=$(<"$device/class")
+    if ((whole)) || [[ $(<"$device/vendor") == "$vendor" && ($class == 0x03* || $class == 0x0403*) ]]; then
+      members+=("$(basename "$device")")
+    fi
+  done
+  printf '%s\n' "${members[@]}"
+}
+
+# The IOMMU groups of the lent functions; an integrated GPU's functions each
+# have one.
+groups() {
+  local function
+  for function in "$@"; do basename "$(readlink "$devices/$function/iommu_group")"; done | sort -u
 }
 
 driver() {
@@ -47,20 +74,27 @@ driver() {
 }
 
 status() {
-  local card function device
+  local card function device lent
   card=$(gpu)
   echo "card $card: $(lspci -s "$card" | cut -d' ' -f2-)"
   echo "boot VGA: $(<"$devices/$card/boot_vga")"
-  for function in $(functions "$card"); do
+  mapfile -t lent < <(functions "$card")
+  for function in "${lent[@]}"; do
     echo "$function: driver $(driver "$function"), IOMMU group $(basename "$(readlink "$devices/$function/iommu_group")")"
   done
-  for device in "$devices/$card/iommu_group/devices"/*; do
-    [[ $(basename "$device") == "${card%.*}".* ]] && continue
-    echo "WARNING: $(basename "$device") shares the card's IOMMU group"
+  for device in "$devices/${card%.*}".*; do
+    [[ " ${lent[*]} " == *" $(basename "$device") "* ]] && continue
+    echo "$(basename "$device"): stays with the host, driver $(driver "$(basename "$device")")"
+  done
+  for function in "${lent[@]}"; do
+    for device in "$devices/$function/iommu_group/devices"/*; do
+      [[ " ${lent[*]} " == *" $(basename "$device") "* ]] && continue
+      echo "WARNING: $(basename "$device") shares the IOMMU group of $function"
+    done
   done
   local displays=()
   for device in "$devices"/*; do
-    [[ $(<"$device/class") == 0x03* && $(basename "$device") != "${card%.*}".* ]] || continue
+    [[ $(<"$device/class") == 0x03* && " ${lent[*]} " != *" $(basename "$device") "* ]] || continue
     displays+=("$(basename "$device")")
   done
   if ((${#displays[@]})); then
@@ -74,6 +108,9 @@ bind() {
   local function=$1
   local current
   current=$(driver "$function")
+  # A function vfio-pci held before the run (a vfio-pci.ids= option) stays
+  # with it afterwards.
+  [[ $current == vfio-pci ]] && kept+=("$function")
   if [[ $current != none ]]; then
     echo "$function" >"$devices/$function/driver/unbind"
   fi
@@ -89,6 +126,7 @@ bind() {
 
 release() {
   local function=$1
+  [[ " ${kept[*]} " == *" $function "* ]] && return
   if [[ $(driver "$function") == vfio-pci ]]; then
     echo "$function" >"$devices/$function/driver/unbind"
   fi
@@ -116,13 +154,16 @@ restore() {
   local function console
   set +e
   for function in "${members[@]}"; do release "$function"; done
-  [[ -e /dev/vfio/$group ]] && chown root:root "/dev/vfio/$group"
+  for group in $(groups "${members[@]}"); do
+    [[ -e /dev/vfio/$group ]] && chown root:root "/dev/vfio/$group"
+  done
   if ((nvidia)); then
     modprobe nvidia_drm
     modprobe nvidia_uvm
     systemctl start nvidia-persistenced.service 2>/dev/null
   fi
   for function in "${members[@]}"; do
+    [[ " ${kept[*]} " == *" $function "* ]] && continue
     echo "$function" >/sys/bus/pci/drivers_probe
   done
   for console in /sys/class/vtconsole/vtcon*; do
@@ -151,7 +192,7 @@ run() {
   local card
   card=$(gpu)
   mapfile -t members < <(functions "$card")
-  group=$(basename "$(readlink "$devices/$card/iommu_group")")
+  kept=()
   stopped=0
   nvidia=0
   trap restore EXIT
@@ -167,7 +208,8 @@ run() {
   fi
   local function
   for function in "${members[@]}"; do bind "$function"; done
-  chown "$owner" "/dev/vfio/$group"
+  local group
+  for group in $(groups "${members[@]}"); do chown "$owner" "/dev/vfio/$group"; done
   ulimit -l unlimited
   local code=0
   # Stopping the service ends the command too: first let the card write no
