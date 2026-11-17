@@ -187,12 +187,9 @@ unsafe impl Timer for PhysicalTimer {
     }
 }
 fn inputs() -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
-    inputs_for(0x1234_10de)
-}
-fn inputs_for(identity: u32) -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State::default()));
     let mut words = [0; 128];
-    words[0] = identity;
+    words[0] = 0x1234_10de;
     words[1] = 0x0010_0402;
     words[2] = 0x0300_0001;
     words[4] = 0xfe00_0000;
@@ -272,29 +269,6 @@ fn preflight_never_seals_or_resets_an_unsupported_or_foreign_source() {
         drop(failed);
         kept(&state.borrow());
     }
-}
-#[test]
-fn an_amd_gpu_binds_without_the_reset_its_driver_makes_itself() {
-    // An RX 9070 or 6800 XT, which offers no FLR, untranslated and with its
-    // bus reset offered: amdgpu resets it itself, so none happens here.
-    let (mut inputs, state) = inputs_for(0x7550_1002);
-    inputs.requester.function.config().words[0x44 / 4] = 0;
-    state.borrow_mut().bus_reset = true;
-    let candidate = check_candidate(
-        &mut inputs.requester.function,
-        &PhysicalTimer(state.clone()),
-        false,
-        true,
-    );
-    assert_eq!(candidate, Ok(Some(Reset::Driver)));
-    {
-        let ready = Cold::new(inputs)
-            .quiesce_and_bind()
-            .unwrap_or_else(|error| panic!("{:?}", error.error));
-        assert_eq!(ready.reset(), Some(Reset::Driver));
-        assert_eq!(state.borrow().events, ["views-seal", "root-drain", "bind"]);
-    }
-    kept(&state.borrow());
 }
 #[test]
 fn failed_original_cpu_view_retirement_cannot_reset_or_bind() {
@@ -431,6 +405,7 @@ fn no_reset_starts_unreset_only_when_dma_is_translated() {
             &PhysicalTimer(state.clone()),
             translated,
             false,
+            false,
         );
         let mut cold = Cold::new(inputs);
         if translated {
@@ -468,6 +443,7 @@ fn without_a_function_reset_or_translation_the_bus_is_reset() {
             &PhysicalTimer(state.clone()),
             false,
             true,
+            false,
         );
         assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
         let result = Cold::new(inputs).quiesce_and_bind();
@@ -500,6 +476,7 @@ fn a_function_reset_comes_before_the_bus_reset() {
             &PhysicalTimer(state.clone()),
             translated,
             true,
+            false,
         );
         assert_eq!(
             candidate,
@@ -521,6 +498,63 @@ fn a_function_reset_comes_before_the_bus_reset() {
     }
 }
 
+/// A GPU whose driver resets it itself (amdgpu) and that has no function
+/// reset starts with no reset of Stela's, before any bus reset, with bus
+/// mastering still off; one with FLR still gets FLR first.
+#[test]
+fn a_driver_that_resets_its_gpu_comes_after_the_function_reset_and_before_the_bus_reset() {
+    for (flr, bus, translated) in [
+        (false, false, false),
+        (false, true, false),
+        (false, true, true),
+        (true, true, false),
+    ] {
+        let (mut inputs, state) = inputs();
+        if !flr {
+            let words = &mut inputs.requester.function.config().words;
+            words[0x44 / 4] = 0;
+            words[0x84 / 4] = 8;
+        }
+        state.borrow_mut().bus_reset = bus;
+        let candidate = check_candidate(
+            &mut inputs.requester.function,
+            &PhysicalTimer(state.clone()),
+            translated,
+            bus,
+            true,
+        );
+        let expected = if flr {
+            Reset::Function(ResetMethod::FunctionLevel)
+        } else {
+            Reset::Driver
+        };
+        assert_eq!(candidate, Ok(Some(expected)));
+        // SAFETY: the symbolic driver stands for one that resets its GPU.
+        let mut cold = unsafe { Cold::new(inputs).driver_resets() };
+        if translated {
+            // SAFETY: the symbolic domain stands for a translating one.
+            cold = unsafe { cold.translated() };
+        }
+        let ready = cold
+            .quiesce_and_bind()
+            .unwrap_or_else(|error| panic!("{:?}", error.error));
+        assert_eq!(ready.reset(), Some(expected));
+        let events = state.borrow().events.clone();
+        if flr {
+            assert_eq!(events, ["views-seal", "flr", "root-drain", "bind"]);
+        } else {
+            assert_eq!(events, ["views-seal", "root-drain", "bind"]);
+        }
+        // SAFETY: symbolic CPU-only diagnostic handover.
+        let (mut bound, _views) = unsafe { ready.into_parts() };
+        assert_eq!(
+            bound.0.function.config().words[1] & 4,
+            0,
+            "bus mastering stays off"
+        );
+    }
+}
+
 /// A GPU an earlier run left holding its secure region needs a reset even
 /// when its DMA is translated, so an available bus reset is not skipped.
 #[test]
@@ -537,6 +571,7 @@ fn a_translated_function_without_a_function_reset_still_gets_the_bus_reset() {
         &PhysicalTimer(state.clone()),
         true,
         true,
+        false,
     );
     assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
     // SAFETY: the symbolic domain stands for a translating one.

@@ -24,6 +24,12 @@ pub struct Kernel {
     /// The BAR of the device's register window, whose first page the boot
     /// reads before the function's reset.
     pub registers: fn(&Adapter) -> usize,
+    /// Whether the driver's probe takes the GPU from the firmware itself,
+    /// resetting it with the family's own reset where a previous driver left
+    /// it running (amdgpu's `amdgpu_device_need_reset_on_init`), so that a
+    /// function without a function-local reset is handed over with bus
+    /// mastering off and no reset of the boot's, as Linux binds it.
+    pub resets_itself: bool,
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
@@ -118,6 +124,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         // with a chip it does not know is its probe's answer.
         admits: |_| Ok(()),
         registers: |_| 0,
+        resets_itself: false,
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,
@@ -147,6 +154,7 @@ pub static AMD: GpuStack = GpuStack {
         // `rmmio_base` (`amdgpu_device.c`): BAR 5 from Bonaire on, BAR 2
         // before; BAR 0 is the memory aperture.
         registers: crate::amdgpu::registers,
+        resets_itself: true,
         // The mask the device's memory controller block sets
         // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
         dma_bits: crate::amdgpu::dma_bits,
@@ -194,6 +202,7 @@ pub static INTEL: GpuStack = GpuStack {
         admits: crate::xe::admits,
         // GTTMMADR (`regs/xe_bars.h`): the registers, then the GTT.
         registers: |_| 0,
+        resets_itself: false,
         // The platform's `dma_mask_size` (`xe_pci.c`), which
         // `xe_set_dma_info` sets as the mask.
         dma_bits: crate::xe::dma_bits,
@@ -613,6 +622,13 @@ mod tests {
         assert_eq!(AMD.kernel.table_integrated(&integrated), Some(true));
         integrated.device = 0x6798;
         assert_eq!((AMD.kernel.registers)(&integrated), 2);
+        // amdgpu resets its GPUs at its probe; nouveau and xe do not.
+        assert!(AMD.kernel.resets_itself);
+        assert!(
+            STACKS
+                .iter()
+                .all(|stack| stack.kernel.resets_itself == (stack.vendor == Vendor::Amd))
+        );
     }
 
     #[test]

@@ -1110,8 +1110,14 @@ fn claim(
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
     let translated = services.dma_translated(address);
-    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
-        .map_err(|error| cold_refusal(address, error))?;
+    gpu::cold::check_candidate(
+        function,
+        timer.as_ref(),
+        translated,
+        bus_reset,
+        stack.kernel.resets_itself,
+    )
+    .map_err(|error| cold_refusal(address, error))?;
     let owns_screen = match gop {
         ScreenOwner::Function(source) if source.address == address => {
             source.bar.words().try_for_each(|(offset, expected)| {
@@ -1285,6 +1291,11 @@ fn claim(
         // its private domain is the one the cold attempt binds.
         cold = unsafe { cold.translated() };
     }
+    if stack.kernel.resets_itself {
+        // SAFETY: this stack's driver takes the GPU from the firmware at its
+        // probe, resetting it where a previous driver left it running.
+        cold = unsafe { cold.driver_resets() };
+    }
     // The seal and the reset below end the firmware's picture on this GPU.
     screen.spend();
     let ready = cold
@@ -1300,7 +1311,7 @@ fn claim(
         .map(|(index, region)| (index, region.size))
         .collect();
     let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
-    // A driver that resets the GPU itself has not yet: the BARs are firmware's.
+    // Only a reset of the boot's restores the BARs' firmware sizes.
     let reset = matches!(
         ready.reset(),
         Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
@@ -1309,12 +1320,11 @@ fn claim(
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
+        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; its driver takes it from the firmware at its probe, with bus mastering off until then; kept {sizes}\n"
+        )),
         Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
             "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
-        )),
-        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
-            "GPU {address}: no reset at claim; {} resets it itself; {sizes}\n",
-            stack.kernel.driver
         )),
         Some(gpu::cold::Reset::Function(method)) => {
             let name = match method {

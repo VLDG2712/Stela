@@ -483,6 +483,7 @@ mod tests {
                 driver: "xe",
                 admits: crate::xe::admits,
                 registers: |_| 0,
+                resets_itself: false,
                 dma_bits: crate::xe::dma_bits,
                 integrated: crate::xe::integrated,
                 probed_integrated: None,
