@@ -151,3 +151,22 @@ fn atrm_is_read_in_pieces_up_to_the_first_short_one() {
     assert_eq!(read.image[..2], [0x55, 0xaa]);
     assert_eq!(read.image[2 * ATRM_PAGE], 0x01);
 }
+
+#[test]
+fn atpx_powers_the_discrete_gpu_on_where_it_controls_its_power() {
+    let _serial = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let session = session();
+    let powered = atpx_power_on(&session).unwrap();
+    let AtpxPower::On(path) = powered else {
+        panic!("{powered:?}");
+    };
+    assert!(path.ends_with("IGPU"), "{path}");
+    let kept = session
+        .handle("\\_SB.IGPU.PWRB")
+        .unwrap()
+        .evaluate(None, &[])
+        .unwrap();
+    assert!(matches!(kept, Some(Value::Buffer(bytes)) if bytes == [3, 0, 1]));
+}

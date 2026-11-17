@@ -14,6 +14,10 @@
 //! on the boot processor before the other processors start and before the
 //! guest; every wait is bounded and taken in slices of [`SLICE_US`]. One
 //! line per port says what happened and how long it took.
+//!
+//! A hybrid laptop's discrete AMD GPU whose port has no power resources is
+//! powered through `ATPX` instead, where the scan found fewer than two
+//! display functions ([`atpx_power_on`]).
 use super::{aml::HostAcpi, host};
 use crate::{native_mmio::Source, output};
 use alloc::{format, string::String, vec::Vec};
@@ -27,7 +31,10 @@ use stela_drivers::{
             power_up_config,
         },
     },
-    probe::d3cold::{self, PowerOnError, PoweredOn, Topology},
+    probe::{
+        d3cold::{self, PowerOnError, PoweredOn, Topology},
+        gpu_methods::{self, AtpxPower},
+    },
 };
 
 /// The longest one spin of a wait.
@@ -221,6 +228,115 @@ pub(super) fn power_on_ports(acpi: &'static HostAcpi, source: &'static Source, t
                  lies below it stays off and the PCI census does not see it\n"
             )),
         }
+    }
+    atpx_power_on(acpi, source, &mut topology, tsc_hz);
+}
+
+/// A hybrid laptop's discrete AMD GPU off with no power resources of its
+/// own, powered on through `ATPX` as amdgpu powers it
+/// ([`gpu_methods::atpx_power_on`]), then each empty port waited for as
+/// above. Linux sees both GPUs before amdgpu's `ATPX` handler starts
+/// (`amdgpu_atpx_detect` counts two display functions), so this runs only
+/// where the scan found fewer than two display functions and a port that
+/// is no empty hot-plug slot is still empty. Nothing is logged where the
+/// namespace has no `ATPX`.
+fn atpx_power_on(
+    acpi: &'static HostAcpi,
+    source: &'static Source,
+    topology: &mut Topology,
+    tsc_hz: u64,
+) {
+    if topology.displays() >= 2 {
+        return;
+    }
+    let empty: Vec<Address> = topology
+        .empty_ports()
+        .filter(|&address| !d3cold::slot_empty(&Unclaimed { source, address }).unwrap_or(true))
+        .collect();
+    if empty.is_empty() {
+        return;
+    }
+    let path = match acpi.firmware(
+        "ATPX power-on",
+        "the discrete GPU stays as firmware left it",
+        true,
+        gpu_methods::atpx_power_on,
+    ) {
+        Some(Ok(AtpxPower::On(path))) => path,
+        Some(Ok(AtpxPower::Absent)) | None => return,
+        Some(Ok(AtpxPower::NoPowerControl(path))) => {
+            output::arguments(format_args!(
+                "HOST PCI ATPX at {path} does not control the discrete GPU's power; the GPU \
+                 stays as firmware left it\n"
+            ));
+            return;
+        }
+        Some(Ok(AtpxPower::Failed(path, status))) => {
+            output::arguments(format_args!(
+                "HOST PCI ATPX at {path} failed with ACPICA status {status:#x}; the discrete \
+                 GPU stays as firmware left it\n"
+            ));
+            return;
+        }
+        Some(Err(error)) => {
+            output::arguments(format_args!(
+                "HOST PCI ATPX not called: the ACPI devices are unreadable (status {:#x})\n",
+                error.0
+            ));
+            return;
+        }
+    };
+    let delay = |microseconds| wait(tsc_hz, microseconds);
+    let mut answered = Vec::new();
+    for port in empty {
+        let Some(secondary) = topology.secondary(port) else {
+            continue;
+        };
+        let config = Unclaimed {
+            source,
+            address: port,
+        };
+        let child = Address {
+            segment: port.segment,
+            bus: secondary,
+            device: 0,
+            function: 0,
+        };
+        let first = Unclaimed {
+            source,
+            address: child,
+        };
+        if !matches!(
+            wait_for_secondary_bus(&config, &first, delay),
+            Ok(SecondaryBus::Ready)
+        ) {
+            continue;
+        }
+        let identity = first.read32(0).unwrap_or(u32::MAX);
+        for function in topology.scan_below(port, |address, offset| {
+            source.read_firmware_config(address, offset, 4).ok()
+        }) {
+            let mut config = Unclaimed {
+                source,
+                address: function,
+            };
+            let _ = power_up_config(&mut config, delay);
+        }
+        answered.push(format!(
+            "{child} answers below {port}, {:04x}:{:04x}",
+            identity & 0xffff,
+            identity >> 16
+        ));
+    }
+    if answered.is_empty() {
+        output::arguments(format_args!(
+            "HOST PCI ATPX at {path} powered the discrete GPU on; no empty port's link came up\n"
+        ));
+    } else {
+        output::arguments(format_args!(
+            "HOST PCI ATPX at {path} powered the discrete GPU on: {}\n",
+            answered.join("; ")
+        ));
     }
 }
 

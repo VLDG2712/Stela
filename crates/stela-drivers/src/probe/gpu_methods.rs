@@ -1,14 +1,17 @@
 //! The ACPI methods of AMD's graphics interface, which amdgpu calls where
 //! Linux builds its ACPI support (`amdgpu_bios.c`, `amdgpu_atpx_handler.c`,
 //! `amdgpu_acpi.c`). Stela's Linux profile does not build it, so the boot
-//! calls the one a hybrid laptop's discrete GPU needs for its video BIOS, as
-//! amdgpu calls it, and names the rest once:
+//! calls the two a hybrid laptop's discrete GPU needs to be usable, as
+//! amdgpu calls them, and names the rest once:
 //!
 //! - `ATRM` hands out the discrete GPU's video BIOS in 4 KiB pieces
 //!   (`amdgpu_atrm_get_bios`); [`atrm`] reads it during the PCI census and
 //!   the claim gives it to Linux as the function's platform ROM.
-//! - `ATPX`, `ATIF` and `ATCS` are not called: [`METHODS`] says what amdgpu
-//!   does without them.
+//! - `ATPX` function 2 powers the discrete GPU (`amdgpu_atpx_set_discrete_state`);
+//!   [`atpx_power_on`] turns it on before the PCI census where it is off and
+//!   its port has no power resources of its own.
+//! - `ATPX`'s mux switching and runtime power-off, `ATIF` and `ATCS` are not
+//!   called: [`METHODS`] says what amdgpu does without them.
 use super::native::{Bridge, companion};
 use crate::bus::pci::Address;
 use crate::platform::acpi::{Argument, Error, Handle, Session, Value};
@@ -19,7 +22,9 @@ use alloc::{string::String, vec::Vec};
 pub const METHODS: [(&str, &str); 3] = [
     (
         "ATPX",
-        "the discrete GPU stays powered and the display mux stays as firmware set it",
+        "the boot only powers the discrete GPU on through it when it is off; Linux's runtime \
+         power-off and display mux switching through it are not done, so the discrete GPU \
+         stays powered and the mux stays as firmware set it",
     ),
     (
         "ATIF",
@@ -106,6 +111,104 @@ pub fn read_atrm(device: Handle<'_>) -> Vec<u8> {
         }
     }
     image
+}
+
+/// `ATPX` functions and the bits of their answers (`amd_acpi.h`).
+const VERIFY_INTERFACE: u64 = 0;
+const GET_PX_PARAMETERS: u64 = 1;
+const POWER_CONTROL: u64 = 2;
+const GET_PX_PARAMETERS_SUPPORTED: u32 = 1 << 0;
+const POWER_CONTROL_SUPPORTED: u32 = 1 << 1;
+const DYNAMIC_PX_SUPPORTED: u32 = 1 << 7;
+const DYNAMIC_DGPU_POWER_OFF_SUPPORTED: u32 = 1 << 10;
+const MS_HYBRID_GFX_SUPPORTED: u32 = 1 << 14;
+
+/// What powering the discrete GPU on through `ATPX` did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AtpxPower {
+    /// The namespace has no `ATPX`.
+    Absent,
+    /// `ATPX` at this path does not control the discrete GPU's power.
+    NoPowerControl(String),
+    /// `ATPX` at this path turned the discrete GPU on.
+    On(String),
+    /// A call failed with this ACPICA status.
+    Failed(String, u32),
+}
+
+/// Call `ATPX` function `function` with `parameters` (or the fake second
+/// integer amdgpu passes without), as `amdgpu_atpx_call` does.
+fn atpx_call(
+    device: Handle<'_>,
+    function: u64,
+    parameters: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    let second = match parameters {
+        Some(bytes) => Argument::Buffer(bytes),
+        None => Argument::Integer(0),
+    };
+    match device.evaluate(Some("ATPX"), &[Argument::Integer(function), second])? {
+        Some(Value::Buffer(answer)) => Ok(answer),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    bytes.get(at..at + 4).map_or(0, |word| {
+        u32::from_le_bytes([word[0], word[1], word[2], word[3]])
+    })
+}
+
+/// Whether the `ATPX` at `device` controls the discrete GPU's power, as
+/// `amdgpu_atpx_verify_interface`, `amdgpu_atpx_parse_functions` and
+/// `amdgpu_atpx_validate` decide it: the interface's power control bit, or
+/// a PX parameter that implies it (dynamic PX, dynamic power-off, or
+/// hybrid graphics, which amdgpu powers through `ATPX` where the port has
+/// no power management of its own, the case this is called for).
+pub fn atpx_controls_power(device: Handle<'_>) -> Result<bool, Error> {
+    // `struct atpx_verify_interface`: size, version, supported functions.
+    let interface = atpx_call(device, VERIFY_INTERFACE, None)?;
+    let functions = u32_at(&interface, 4);
+    let mut control = functions & POWER_CONTROL_SUPPORTED != 0;
+    if functions & GET_PX_PARAMETERS_SUPPORTED != 0 {
+        // `struct atpx_px_params`: size, valid flags, flags.
+        let parameters = atpx_call(device, GET_PX_PARAMETERS, None)?;
+        let size = parameters
+            .get(..2)
+            .map_or(0, |size| u16::from_le_bytes([size[0], size[1]]));
+        if size >= 10 {
+            let valid = u32_at(&parameters, 2) & u32_at(&parameters, 6);
+            control |= valid
+                & (DYNAMIC_PX_SUPPORTED
+                    | DYNAMIC_DGPU_POWER_OFF_SUPPORTED
+                    | MS_HYBRID_GFX_SUPPORTED)
+                != 0;
+        }
+    }
+    Ok(control)
+}
+
+/// Turn the discrete GPU on through the first `ATPX` in the namespace that
+/// controls its power: `struct atpx_power_control` of 3 bytes with state 1,
+/// as `amdgpu_atpx_set_discrete_state(atpx, ATPX_DISCRETE_GPU)`.
+pub fn atpx_power_on(session: &Session) -> Result<AtpxPower, Error> {
+    let Some(device) = session
+        .all_devices()?
+        .into_iter()
+        .find(|device| device.child("ATPX").is_ok())
+    else {
+        return Ok(AtpxPower::Absent);
+    };
+    let path = device.path().unwrap_or_default();
+    match atpx_controls_power(device) {
+        Ok(true) => {}
+        Ok(false) => return Ok(AtpxPower::NoPowerControl(path)),
+        Err(error) => return Ok(AtpxPower::Failed(path, error.0)),
+    }
+    Ok(match atpx_call(device, POWER_CONTROL, Some(&[3, 0, 1])) {
+        Ok(_) => AtpxPower::On(path),
+        Err(error) => AtpxPower::Failed(path, error.0),
+    })
 }
 
 #[cfg(test)]

@@ -148,6 +148,11 @@ impl Topology {
         })
     }
 
+    /// How many display functions (base class 3) the scan found.
+    pub fn displays(&self) -> usize {
+        self.found.iter().filter(|(_, class)| class[0] == 3).count()
+    }
+
     /// The bridges whose secondary bus holds none of the functions found.
     pub fn empty_ports(&self) -> impl Iterator<Item = Address> + '_ {
         empty_ports(&self.bridges, &self.found).map(|bridge| bridge.address)
