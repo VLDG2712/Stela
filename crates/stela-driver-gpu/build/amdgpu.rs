@@ -379,12 +379,27 @@ pub fn tables() {
             "a revision quirk moves {listed} to {quirked}, which sets another DMA mask"
         );
     }
+    // The register window's BAR of each family (`rmmio_base`).
+    let window = RegisterWindow::read(
+        &source("amdgpu_device.c"),
+        &read(PathBuf::from(
+            "../../third_party/linux/include/drm/amd_asic_type.h",
+        )),
+    )
+    .unwrap_or_else(|error| panic!("amdgpu's register window: {error}"));
+    for (listed, quirked) in &table.quirks {
+        assert!(
+            window.bar(listed) == window.bar(quirked),
+            "a revision quirk moves {listed} to {quirked}, whose registers are in another BAR"
+        );
+    }
     let mut text = String::from(
         "/// amdgpu's `pciidlist` entries that name a device: its ID, the bits of\n\
-         /// the DMA mask its family's memory controller sets, and the probe's answer.\n\
-         pub(crate) const DEVICES: &[(u16, u8, Support)] = &[\n",
+         /// the DMA mask its family's memory controller sets, the probe's answer,\n\
+         /// whether the table flags it `AMD_IS_APU`, and the BAR of its registers.\n\
+         pub(crate) const DEVICES: &[(u16, u8, Support, bool, u8)] = &[\n",
     );
-    for (device, family) in &table.devices {
+    for (device, (family, apu)) in &table.devices {
         let bits = family_mask(family);
         let support = match table.unbuilt.get(family) {
             Some(generation) => {
@@ -392,7 +407,10 @@ pub fn tables() {
             }
             None => "Support::Probed".to_owned(),
         };
-        text.push_str(&format!("    ({device:#06x}, {bits}, {support}),\n"));
+        let bar = window.bar(family);
+        text.push_str(&format!(
+            "    ({device:#06x}, {bits}, {support}, {apu}, {bar}),\n"
+        ));
     }
     text.push_str(
         "];\n/// The classes (base, sub-class, interface) of which the table takes any\n\
@@ -411,7 +429,10 @@ pub fn tables() {
     }
     text.push_str(&format!(
         "];\n/// The narrowest mask of the memory controllers IP discovery chooses from.\n\
-         pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n"
+         pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n\
+         /// The BAR of the registers of a device IP discovery identifies.\n\
+         pub(crate) const DISCOVERY_REGISTERS: u8 = {};\n",
+        window.bar("CHIP_IP_DISCOVERY")
     ));
     text.push_str(
         "/// amdgpu's interface's families (`AMDGPU_FAMILY_*`), by number.\n\
@@ -449,8 +470,9 @@ fn families(header: &str) -> Vec<(u32, String)> {
 /// `amdgpu_drv.c`'s device table and probe rules.
 #[derive(Debug, Default, PartialEq)]
 struct Table {
-    /// Each device the table names, with its family (`CHIP_*`).
-    devices: BTreeMap<u16, String>,
+    /// Each device the table names, with its family (`CHIP_*`) and whether
+    /// the table flags it `AMD_IS_APU`.
+    devices: BTreeMap<u16, (String, bool)>,
     /// The class entries, as `class << 8`.
     classes: Vec<u32>,
     unsupported: BTreeSet<u16>,
@@ -512,18 +534,22 @@ impl Table {
             }
             let mut flags = flags.split('|');
             let family = flags.next().unwrap_or("");
+            let flags = flags.collect::<Vec<_>>();
             // Mobility and APU do not change the probe's answer; a flag that
             // does (experimental support) needs its rule here first.
             if !family.starts_with("CHIP_")
-                || flags.any(|flag| !["AMD_IS_MOBILITY", "AMD_IS_APU"].contains(&flag))
+                || flags
+                    .iter()
+                    .any(|flag| !["AMD_IS_MOBILITY", "AMD_IS_APU"].contains(flag))
             {
                 return Err(format!(
                     "entry {entry:?} has flags this reader does not know"
                 ));
             }
+            let apu = flags.contains(&"AMD_IS_APU");
             if table
                 .devices
-                .insert(hex(device)?, family.to_owned())
+                .insert(hex(device)?, (family.to_owned(), apu))
                 .is_some()
             {
                 return Err(format!("{device} is listed twice"));
@@ -602,7 +628,7 @@ impl Table {
             let [device, _, family] = fields.as_slice() else {
                 return Err(format!("quirk {quirk:?}"));
             };
-            let listed = table
+            let (listed, _) = table
                 .devices
                 .get(&hex(device)?)
                 .ok_or_else(|| format!("quirk {quirk:?} names no listed device"))?;
@@ -612,6 +638,71 @@ impl Table {
             table.quirks.push((listed.clone(), (*family).to_owned()));
         }
         Ok(table)
+    }
+}
+
+/// `amdgpu_device_init`'s choice of the register window's BAR: `newer` for
+/// the families from `first` on in `enum amd_asic_type`'s order, `older`
+/// for those before it.
+#[derive(Debug, PartialEq)]
+struct RegisterWindow {
+    order: Vec<String>,
+    first: String,
+    newer: u8,
+    older: u8,
+}
+
+impl RegisterWindow {
+    fn read(device: &str, types: &str) -> Result<Self, String> {
+        let order = between(types, "enum amd_asic_type {", "};")?
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().split([' ', ',', '=', '\t']).next()?;
+                name.starts_with("CHIP_").then(|| name.to_owned())
+            })
+            .collect::<Vec<_>>();
+        // The first assignment of the window's base and the family test
+        // that guards it, then the assignment of its `else`.
+        let at = device
+            .find("\t\tadev->rmmio_base = pci_resource_start(")
+            .ok_or("no rmmio_base assignment")?;
+        let (_, condition) = device[..at]
+            .rsplit_once("if (adev->asic_type >= ")
+            .ok_or("the rmmio_base assignment has no family test")?;
+        let first = condition
+            .strip_suffix(") {\n")
+            .ok_or_else(|| format!("register window rule {condition:?}"))?;
+        let rest = &device[at..];
+        let older = between(rest, "} else {\n\t\tadev->rmmio_base = ", ";")?;
+        let bar = |text: &str| -> Result<u8, String> {
+            between(text, "pci_resource_start(adev->pdev, ", ")")?
+                .parse()
+                .map_err(|_| format!("register window BAR in {text:?}"))
+        };
+        if !order.iter().any(|name| name == first) {
+            return Err(format!("{first} is no amd_asic_type"));
+        }
+        Ok(Self {
+            first: first.to_owned(),
+            newer: bar(rest)?,
+            older: bar(older)?,
+            order,
+        })
+    }
+
+    /// The register BAR of `family` (`CHIP_*`).
+    fn bar(&self, family: &str) -> u8 {
+        let position = |name: &str| {
+            self.order
+                .iter()
+                .position(|known| known == name)
+                .unwrap_or_else(|| panic!("{name} is no amd_asic_type"))
+        };
+        if position(family) >= position(&self.first) {
+            self.newer
+        } else {
+            self.older
+        }
     }
 }
 

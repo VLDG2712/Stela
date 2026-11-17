@@ -482,7 +482,7 @@ mod tests {
             kernel: crate::stack::Kernel {
                 driver: "xe",
                 admits: crate::xe::admits,
-                registers: 0,
+                registers: |_| 0,
                 dma_bits: crate::xe::dma_bits,
                 integrated: crate::xe::integrated,
                 probed_integrated: None,

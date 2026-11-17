@@ -23,7 +23,7 @@ pub struct Kernel {
     pub admits: fn(&Adapter) -> Result<(), &'static str>,
     /// The BAR of the device's register window, whose first page the boot
     /// reads before the function's reset.
-    pub registers: usize,
+    pub registers: fn(&Adapter) -> usize,
     /// The address bits of the DMA mask the driver sets on this device; a
     /// mapping past it is refused, not truncated.
     pub dma_bits: fn(&Adapter) -> u8,
@@ -117,7 +117,7 @@ pub static NVIDIA: GpuStack = GpuStack {
         // nouveau's table holds every NVIDIA display function; what it does
         // with a chip it does not know is its probe's answer.
         admits: |_| Ok(()),
-        registers: 0,
+        registers: |_| 0,
         // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
         // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
         dma_bits: |_| 47,
@@ -144,16 +144,16 @@ pub static AMD: GpuStack = GpuStack {
     kernel: Kernel {
         driver: "amdgpu",
         admits: crate::amdgpu::admits,
-        // `rmmio_base` of every family from Bonaire on (`amdgpu_device.c`);
-        // BAR 0 is the memory aperture. The older families are refused.
-        registers: 5,
+        // `rmmio_base` (`amdgpu_device.c`): BAR 5 from Bonaire on, BAR 2
+        // before; BAR 0 is the memory aperture.
+        registers: crate::amdgpu::registers,
         // The mask the device's memory controller block sets
         // (`gmc_v*_0.c`), or the narrowest of those IP discovery chooses.
         dma_bits: crate::amdgpu::dma_bits,
         // Its table flags only the older APUs it names by ID; IP discovery
         // flags the rest during the probe, after the claim, so the bound
-        // device's answer decides.
-        integrated: |_| false,
+        // device's answer decides for them.
+        integrated: crate::amdgpu::integrated,
         probed_integrated: Some(crate::amdgpu::query::integrated),
         chip: crate::amdgpu::query::family,
         memory_bytes: crate::amdgpu::query::memory_bytes,
@@ -193,7 +193,7 @@ pub static INTEL: GpuStack = GpuStack {
         driver: "xe",
         admits: crate::xe::admits,
         // GTTMMADR (`regs/xe_bars.h`): the registers, then the GTT.
-        registers: 0,
+        registers: |_| 0,
         // The platform's `dma_mask_size` (`xe_pci.c`), which
         // `xe_set_dma_info` sets as the mask.
         dma_bits: crate::xe::dma_bits,
@@ -607,6 +607,12 @@ mod tests {
         integrated.device = 0x13c0;
         assert_eq!(AMD.kernel.table_integrated(&integrated), None);
         assert!(claim_rank(true, None) > claim_rank(true, Some(false)));
+        // An APU the table names by ID and flags, Renoir, is integrated
+        // before its probe; Southern Islands' registers are in BAR 2.
+        integrated.device = 0x1636;
+        assert_eq!(AMD.kernel.table_integrated(&integrated), Some(true));
+        integrated.device = 0x6798;
+        assert_eq!((AMD.kernel.registers)(&integrated), 2);
     }
 
     #[test]

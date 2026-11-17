@@ -13,15 +13,29 @@ pub(crate) enum Support {
     Probed,
     /// `amdgpu_support_enabled` refuses the family: this build's Kconfig
     /// leaves its support out.
+    #[allow(
+        dead_code,
+        reason = "generated only while the profile leaves a family's support out; it builds all"
+    )]
     NotBuilt(&'static str),
 }
 
-/// The table's entry for `device`, if it names the device by ID.
-fn listed(device: u16) -> Option<(u8, Support)> {
+/// The table's entry for `device`, if it names the device by ID: its DMA
+/// mask's bits, the probe's answer, its `AMD_IS_APU` flag and its register
+/// BAR.
+fn entry(device: u16) -> Option<(u8, Support, bool, u8)> {
     DEVICES
         .binary_search_by_key(&device, |(id, ..)| *id)
         .ok()
-        .map(|index| (DEVICES[index].1, DEVICES[index].2))
+        .map(|index| {
+            let (_, bits, support, apu, registers) = DEVICES[index];
+            (bits, support, apu, registers)
+        })
+}
+
+/// The table's mask bits and probe answer for `device`, if it names it.
+fn listed(device: u16) -> Option<(u8, Support)> {
+    entry(device).map(|(bits, support, ..)| (bits, support))
 }
 
 /// Whether the table's class entries hold the adapter: any AMD function of
@@ -54,6 +68,20 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
 /// the memory controllers discovery can choose.
 pub fn dma_bits(adapter: &Adapter) -> u8 {
     listed(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
+}
+
+/// The BAR of the adapter's register window, as `amdgpu_device_init` maps
+/// it: BAR 2 for the Southern Islands families, BAR 5 from Bonaire on and
+/// for every device IP discovery identifies.
+pub fn registers(adapter: &Adapter) -> usize {
+    usize::from(entry(adapter.device).map_or(DISCOVERY_REGISTERS, |(.., bar)| bar))
+}
+
+/// Whether amdgpu's table flags the adapter `AMD_IS_APU`. It flags only
+/// the older APUs it names by ID; the probe flags the rest from IP
+/// discovery ([`query::integrated`]).
+pub fn integrated(adapter: &Adapter) -> bool {
+    entry(adapter.device).is_some_and(|(_, _, apu, _)| apu)
 }
 
 /// The name amdgpu's interface gives the family `family`
@@ -217,6 +245,28 @@ mod tests {
     }
 
     #[test]
+    fn registers_and_apus_are_the_tables() {
+        // Tahiti (SI): BAR 2. Bonaire (CIK), Polaris 10, Navi 21 and a
+        // device found by class: BAR 5.
+        assert_eq!(registers(&adapter(0x6798, [3, 0, 0])), 2);
+        for device in [0x6649, 0x67df, 0x73bf, 0x0001] {
+            assert_eq!(registers(&adapter(device, [3, 0, 0])), 5, "{device:04x}");
+        }
+        // Kaveri, Carrizo, Raven and Renoir are flagged APUs by ID; a
+        // discrete Polaris is not, and a device found by class is decided
+        // by the probe.
+        for device in [0x1304, 0x9870, 0x15dd, 0x1636] {
+            assert!(integrated(&adapter(device, [3, 0, 0])), "{device:04x}");
+        }
+        for device in [0x67df, 0x13c0, 0x164e] {
+            assert!(!integrated(&adapter(device, [3, 0, 0])), "{device:04x}");
+        }
+        // Every SI family's devices and only those take BAR 2.
+        assert!(DEVICES.iter().any(|(.., bar)| *bar == 2));
+        assert!(DEVICES.iter().all(|(.., bar)| *bar == 2 || *bar == 5));
+    }
+
+    #[test]
     fn families_are_named_as_amdgpus_interface_names_them() {
         assert!(FAMILIES.windows(2).all(|pair| pair[0].0 < pair[1].0));
         // Navi 10, Raphael and Granite Ridge graphics, GFX12.
@@ -244,15 +294,20 @@ mod tests {
         // A device of the list amdgpu leaves to radeon, VGA class or not.
         let radeon = adapter(LEFT_TO_RADEON[0], [3, 0, 0]);
         assert!(admits(&radeon).unwrap_err().contains("radeon"));
-        // Families whose support the profile leaves out are refused with the
-        // driver's own message: Tahiti (SI) and Bonaire (CIK).
-        for (device, generation) in [(0x6798, "SI"), (0x6649, "CIK")] {
-            let refusal = admits(&adapter(device, [3, 0, 0])).unwrap_err();
-            assert_eq!(
-                refusal,
-                alloc::format!("amdgpu built without {generation} support")
-            );
+        // Southern and Sea Islands, which amdgpu's probe takes by default:
+        // Tahiti (SI, GMC 6), Hainan (SI, no display), Bonaire and Kaveri
+        // (CIK, GMC 7), all with 40-bit masks. The profile builds every
+        // family's support, so the probe refuses none.
+        for device in [0x6798, 0x6660, 0x6649, 0x1304] {
+            let gpu = adapter(device, [3, 0, 0]);
+            assert_eq!(admits(&gpu), Ok(()), "{device:04x}");
+            assert_eq!(dma_bits(&gpu), 40, "{device:04x}");
         }
+        assert!(
+            DEVICES
+                .iter()
+                .all(|(_, _, support, ..)| *support == Support::Probed)
+        );
     }
 
     #[test]

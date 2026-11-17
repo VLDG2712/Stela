@@ -1175,7 +1175,7 @@ fn claim(
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    let register_bar = stack.kernel.registers;
+    let register_bar = (stack.kernel.registers)(adapter);
     if let Err(why) = gpu::cold::register_bar(function_bars[register_bar], PAGE) {
         output::arguments(format_args!(
             "GPU {address} register BAR refused: {why:?} BAR{register_bar}={:?}\n",
