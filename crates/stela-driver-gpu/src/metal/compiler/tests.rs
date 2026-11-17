@@ -1659,6 +1659,25 @@ fn targets_follow_the_device() {
 }
 
 #[test]
+fn float_adds_follow_the_device() {
+    let mut device = nvk(&CHIPS[0], 8 << 30);
+    let every = ffi::FLOAT_ADD_DEVICE | ffi::FLOAT_ADD_THREADGROUP;
+    assert_eq!(compiler(&device).target.float_add_by_swap, 0);
+    device.features.shader_buffer_float32_atomic_add = false;
+    assert_eq!(
+        compiler(&device).target.float_add_by_swap,
+        ffi::FLOAT_ADD_DEVICE
+    );
+    device.features.shader_shared_float32_atomic_add = false;
+    assert_eq!(compiler(&device).target.float_add_by_swap, every);
+    device.features.shader_buffer_float32_atomic_add = true;
+    assert_eq!(
+        compiler(&device).target.float_add_by_swap,
+        ffi::FLOAT_ADD_THREADGROUP
+    );
+}
+
+#[test]
 fn bindings_are_reflected_specialized() {
     let (mut compiler, library) = with_library();
     let specialization = Specialization {
@@ -1714,9 +1733,10 @@ fn every_target_limit_keys_the_nir_a_compilation_stores() {
         stencil_export: 9,
         raster_order_groups: 10,
         fragment_tests: 11,
+        float_add_by_swap: 12,
     };
     let limits = target_limits(&base);
-    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     // Where the driver's NIR options live is no limit: it differs by boot.
     let moved = ffi::Target {
         nir: [ptr::dangling(); NIR_STAGES],

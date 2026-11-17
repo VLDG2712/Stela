@@ -305,7 +305,15 @@ pub struct Target {
     /// Nonzero when a stencil output's function runs the fragment tests
     /// itself, without stencil export.
     pub(super) fragment_tests: u32,
+    /// The memory whose float atomic add the device lacks
+    /// (`FLOAT_ADD_DEVICE`, `FLOAT_ADD_THREADGROUP`), compiled as
+    /// compare-and-swap loops.
+    pub(super) float_add_by_swap: u32,
 }
+
+/// `STELA_METAL_FLOAT_ADD_DEVICE` and `STELA_METAL_FLOAT_ADD_THREADGROUP`.
+pub(super) const FLOAT_ADD_DEVICE: u32 = 1;
+pub(super) const FLOAT_ADD_THREADGROUP: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -571,6 +579,11 @@ mod tests {
             ("STELA_METAL_BINDINGS_BYTES", size_of::<Bindings>()),
             ("STELA_METAL_REFLECTION_BYTES", size_of::<Reflection>()),
             ("STELA_METAL_TARGET_BYTES", size_of::<Target>()),
+            ("STELA_METAL_FLOAT_ADD_DEVICE", FLOAT_ADD_DEVICE as usize),
+            (
+                "STELA_METAL_FLOAT_ADD_THREADGROUP",
+                FLOAT_ADD_THREADGROUP as usize,
+            ),
             ("STELA_METAL_NIR_STAGES", super::super::NIR_STAGES),
             (
                 "STELA_METAL_LINKED_VARYING_BYTES",

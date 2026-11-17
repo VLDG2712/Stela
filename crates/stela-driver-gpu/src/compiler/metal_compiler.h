@@ -122,8 +122,14 @@ struct stela_metal_target {
    /* Nonzero when a fragment function writing the stencil reference without
     * stencil export runs the fragment tests itself. */
    uint32_t fragment_tests;
+   /* The memory whose 32-bit float atomic add the device lacks
+    * (STELA_METAL_FLOAT_ADD_*): each such add of a function is a
+    * compare-and-swap loop instead, as Vulkan's integer atomics allow. */
+   uint32_t float_add_by_swap;
 };
 #define STELA_METAL_TARGET_BYTES 112u
+#define STELA_METAL_FLOAT_ADD_DEVICE 1u
+#define STELA_METAL_FLOAT_ADD_THREADGROUP 2u
 
 /* A threadgroup buffer's setThreadgroupMemoryLength:atIndex:. */
 struct stela_metal_threadgroup_length {

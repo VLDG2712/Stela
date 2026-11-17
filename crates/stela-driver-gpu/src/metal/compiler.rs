@@ -426,6 +426,22 @@ impl AirCompiler {
             stencil_export: limits.stencil_export.into(),
             raster_order_groups: device.features.fragment_shader_pixel_interlock.into(),
             fragment_tests: super::capabilities::fragment_tests(device).into(),
+            // Metal's atomic_float adds on device and threadgroup memory;
+            // a device without Vulkan's adds there (ANV before LSC) takes
+            // compare-and-swap loops.
+            float_add_by_swap: [
+                (
+                    device.features.shader_buffer_float32_atomic_add,
+                    ffi::FLOAT_ADD_DEVICE,
+                ),
+                (
+                    device.features.shader_shared_float32_atomic_add,
+                    ffi::FLOAT_ADD_THREADGROUP,
+                ),
+            ]
+            .into_iter()
+            .filter(|(supported, _)| !supported)
+            .fold(0, |memory, (_, bit)| memory | bit),
         };
         // The boot image mounts the linked AIR compiler. Hosted all-feature
         // builds also expose `Service::linked`, but only pull in its external
@@ -1960,7 +1976,7 @@ unsafe extern "C" {
 
 /// Every limit of `target`, which the NIR it compiles depends on, in the
 /// order of its fields; the driver's NIR options are keyed by its build.
-fn target_limits(target: &ffi::Target) -> [u32; 11] {
+fn target_limits(target: &ffi::Target) -> [u32; 12] {
     let ffi::Target {
         nir: _,
         max_instructions,
@@ -1974,6 +1990,7 @@ fn target_limits(target: &ffi::Target) -> [u32; 11] {
         stencil_export,
         raster_order_groups,
         fragment_tests,
+        float_add_by_swap,
     } = *target;
     [
         max_instructions,
@@ -1987,6 +2004,7 @@ fn target_limits(target: &ffi::Target) -> [u32; 11] {
         stencil_export,
         raster_order_groups,
         fragment_tests,
+        float_add_by_swap,
     ]
 }
 

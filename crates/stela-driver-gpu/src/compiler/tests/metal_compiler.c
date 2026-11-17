@@ -1030,6 +1030,48 @@ static const char *mesh =
    "!42 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
    " !\"air.arg_name\", !\"tid\"}\n";
 
+/* Float atomic adds to a device buffer and to threadgroup memory. */
+static const char *float_adds =
+   "@sum = internal addrspace(3) global float undef, align 4\n"
+   "define void @added(ptr addrspace(1) %data, i32 %tid) {\n"
+   "%a = atomicrmw fadd ptr addrspace(1) %data, float 1.0 monotonic, align 4\n"
+   "%b = atomicrmw fadd ptr addrspace(3) @sum, float %a monotonic, align 4\n"
+   "store float %b, ptr addrspace(1) %data, align 4\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @added, !3, !4}\n!3 = !{}\n"
+   "!4 = !{!40, !41}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"data\"}\n"
+   "!41 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
+   " !\"air.arg_name\", !\"tid\"}\n";
+
+/* Adds a float to device memory and to threadgroup memory through AIR's
+ * atomic calls, and stores both old values. */
+static const char *float_add_calls =
+   "@sum = internal addrspace(3) global float undef, align 4\n"
+   "declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)\n"
+   "declare float @air.atomic.local.add.f32(ptr addrspace(3), float, i32, i32, i1)\n"
+   "define void @float_adds(ptr addrspace(1) %data, i32 %tid) {\n"
+   "%f = uitofp i32 %tid to float\n"
+   "%g = call float @air.atomic.global.add.f32(ptr addrspace(1) %data, float %f, i32 0, i32 2,"
+   " i1 true)\n"
+   "%l = call float @air.atomic.local.add.f32(ptr addrspace(3) @sum, float %f, i32 0, i32 1,"
+   " i1 true)\n"
+   "%i = zext i32 %tid to i64\n"
+   "%q = getelementptr float, ptr addrspace(1) %data, i64 %i\n"
+   "%t = fadd float %g, %l\n"
+   "store float %t, ptr addrspace(1) %q, align 4\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @float_adds, !3, !4}\n!3 = !{}\n!4 = !{!40, !41}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"data\"}\n"
+   "!41 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
+   " !\"air.arg_name\", !\"tid\"}\n";
+
 static const struct stela_metal_target target = {
    .nir = STELA_METAL_NIR_ALL(&nir_options),
    .max_instructions = 10000, .max_threadgroup_bytes = 32768,
@@ -4876,6 +4918,131 @@ thread_constants_are_constant_data(void)
    stela_metal_release(shader);
 }
 
+/* The float atomic adds and compare-and-swaps of shader on device memory
+ * and on threadgroup memory. */
+static void
+count_float_adds(nir_shader *shader, unsigned adds[2], unsigned swaps[2])
+{
+   adds[0] = adds[1] = swaps[0] = swaps[1] = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+            bool global = intrin->intrinsic == nir_intrinsic_global_atomic ||
+                          intrin->intrinsic == nir_intrinsic_global_atomic_swap;
+            bool shared = intrin->intrinsic == nir_intrinsic_shared_atomic ||
+                          intrin->intrinsic == nir_intrinsic_shared_atomic_swap;
+            if (!global && !shared)
+               continue;
+            nir_atomic_op op = nir_intrinsic_atomic_op(intrin);
+            adds[shared] += op == nir_atomic_op_fadd;
+            swaps[shared] += op == nir_atomic_op_cmpxchg;
+         }
+      }
+   }
+}
+
+/* A device without float atomic adds on a memory compiles each add there
+ * as a compare-and-swap loop, and keeps the adds it has. */
+static void
+float_adds_swap_where_the_device_lacks_them(void)
+{
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   static const struct {
+      uint32_t memory;
+      unsigned adds[2], swaps[2];
+   } cases[] = {
+      {0, {1, 1}, {0, 0}},
+      {STELA_METAL_FLOAT_ADD_DEVICE, {0, 1}, {1, 0}},
+      {STELA_METAL_FLOAT_ADD_THREADGROUP, {1, 0}, {0, 1}},
+      {STELA_METAL_FLOAT_ADD_DEVICE | STELA_METAL_FLOAT_ADD_THREADGROUP, {0, 0}, {1, 1}},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      struct stela_metal_target lacking = target;
+      lacking.float_add_by_swap = cases[i].memory;
+      LLVMMemoryBufferRef input = bitcode(float_adds);
+      struct stela_air_error error;
+      nir_shader *shader = stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                               "added", &lacking, &specialization, &error);
+      LLVMDisposeMemoryBuffer(input);
+      if (!shader)
+         fprintf(stderr, "added: %u %s\n", error.kind, error.detail);
+      assert(shader);
+      nir_validate_shader(shader, "float adds by swap");
+      unsigned adds[2], swaps[2];
+      count_float_adds(shader, adds, swaps);
+      assert(!memcmp(adds, cases[i].adds, sizeof(adds)) &&
+             !memcmp(swaps, cases[i].swaps, sizeof(swaps)));
+      stela_metal_release(shader);
+   }
+}
+
+/* The float atomic adds of every memory in shader. */
+static unsigned
+float_add_count(nir_shader *shader)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *atomic = nir_instr_as_intrinsic(instr);
+            count += nir_intrinsic_has_atomic_op(atomic) &&
+                     nir_intrinsic_atomic_op(atomic) == nir_atomic_op_fadd;
+         }
+      }
+   }
+   return count;
+}
+
+/* AIR's atomic add calls of whichever memory the device lacks become one
+ * compare-and-swap loop each; the others stay single atomics. */
+static void
+float_add_calls_the_device_lacks_loop(void)
+{
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   LLVMMemoryBufferRef input = bitcode(float_add_calls);
+   const uint32_t every = STELA_METAL_FLOAT_ADD_DEVICE | STELA_METAL_FLOAT_ADD_THREADGROUP;
+   /* The adds the device runs itself, and how many stay adds. */
+   const struct {
+      uint32_t runs;
+      unsigned adds;
+   } cases[] = {
+      {every, 2},
+      {STELA_METAL_FLOAT_ADD_THREADGROUP, 1},
+      {STELA_METAL_FLOAT_ADD_DEVICE, 1},
+      {0, 0},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      struct stela_metal_target own = target;
+      own.float_add_by_swap = every & ~cases[i].runs;
+      struct stela_air_error error;
+      nir_shader *shader = stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                               "float_adds", &own, &specialization, &error);
+      assert(shader);
+      nir_validate_shader(shader, "float add loops");
+      unsigned swaps = count_intrinsic(shader, nir_intrinsic_global_atomic_swap) +
+                       count_intrinsic(shader, nir_intrinsic_ssbo_atomic_swap) +
+                       count_intrinsic(shader, nir_intrinsic_shared_atomic_swap);
+      assert(float_add_count(shader) == cases[i].adds);
+      assert(swaps == 2 - cases[i].adds);
+      unsigned loops = 0;
+      nir_foreach_function_impl(impl, shader) {
+         nir_foreach_block(block, impl) {
+            nir_cf_node *parent = block->cf_node.parent;
+            loops += parent->type == nir_cf_node_loop &&
+                     nir_loop_first_block(nir_cf_node_as_loop(parent)) == block;
+         }
+      }
+      assert(loops == 2 - cases[i].adds);
+      stela_metal_release(shader);
+   }
+   LLVMDisposeMemoryBuffer(input);
+}
+
 /* A threadgroup bfloat array holds the bfloat bits stored to it. */
 static void
 threadgroup_globals_hold_bfloat(void)
@@ -5182,6 +5349,8 @@ main(void)
    dynamic_kernels_take_their_dispatch_shape();
    untyped_threadgroup_buffers_take_their_dispatch_lengths();
    thread_constants_are_constant_data();
+   float_adds_swap_where_the_device_lacks_them();
+   float_add_calls_the_device_lacks_loop();
    threadgroup_globals_hold_bfloat();
    pointers_made_of_addresses_reach_their_memory();
    null_pointer_phis_stay_among_phis();

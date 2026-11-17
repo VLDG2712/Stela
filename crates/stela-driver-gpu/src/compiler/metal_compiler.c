@@ -878,6 +878,58 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
 /* Thread memory of at most this many 32-bit words lives in registers. */
 #define REGISTER_THREAD_WORDS 16
 
+/* Whether intrinsic is a 32-bit float add the target compiles as a swap
+ * loop: a device memory add (an address's) or a threadgroup memory one. */
+static bool
+float_add_by_swap(const nir_intrinsic_instr *intrin, uint32_t memory)
+{
+   if ((intrin->intrinsic != nir_intrinsic_global_atomic &&
+        intrin->intrinsic != nir_intrinsic_shared_atomic) ||
+       intrin->def.bit_size != 32 || nir_intrinsic_atomic_op(intrin) != nir_atomic_op_fadd)
+      return false;
+   return memory & (intrin->intrinsic == nir_intrinsic_global_atomic ?
+                       STELA_METAL_FLOAT_ADD_DEVICE : STELA_METAL_FLOAT_ADD_THREADGROUP);
+}
+
+/* Each float add the target lacks as a loop that adds to the value last
+ * read and swaps the sum in where memory still holds that value, compared
+ * as bits (nir_lower_atomics.c's loop): the add of a device without
+ * VK_EXT_shader_atomic_float's for that memory. */
+static bool
+swap_float_add(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   if (!float_add_by_swap(intrin, *(const uint32_t *)data))
+      return false;
+   b->cursor = nir_before_instr(&intrin->instr);
+   const bool global = intrin->intrinsic == nir_intrinsic_global_atomic;
+   nir_def *address = intrin->src[0].ssa;
+   const unsigned base = global ? 0 : nir_intrinsic_base(intrin);
+   nir_def *first = global ? nir_load_global(b, 1, 32, address,
+                                             .access = ACCESS_ATOMIC | ACCESS_COHERENT)
+                           : nir_load_shared(b, 1, 32, address, .base = base, .align_mul = 4,
+                                             .access = ACCESS_ATOMIC);
+   nir_def *value = intrin->src[1].ssa;
+   nir_loop *loop = nir_push_loop(b);
+   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&phi->instr, &phi->def, 1, 32);
+   nir_phi_instr_add_src(phi, nir_def_block(first), first);
+   nir_def *before = &phi->def;
+   nir_def *sum = nir_fadd(b, before, value);
+   nir_alu_instr *add = nir_def_as_alu(sum);
+   add->fp_math_ctrl = nir_op_valid_fp_math_ctrl(add->op, nir_fp_no_fast_math);
+   nir_def *found = global ? nir_global_atomic_swap(b, 32, address, before, sum,
+                                                    .atomic_op = nir_atomic_op_cmpxchg)
+                           : nir_shared_atomic_swap(b, 32, address, before, sum, .base = base,
+                                                    .atomic_op = nir_atomic_op_cmpxchg);
+   nir_break_if(b, nir_ieq(b, found, before));
+   nir_phi_instr_add_src(phi, nir_loop_last_block(loop), found);
+   b->cursor = nir_before_block(nir_loop_first_block(loop));
+   nir_builder_instr_insert(b, &phi->instr);
+   nir_pop_loop(b, loop);
+   nir_def_replace(&intrin->def, found);
+   return true;
+}
+
 /* Moves small thread memory out of scratch into registers. The front end
  * lays a function's thread memory out as scratch; when it fits in
  * REGISTER_THREAD_WORDS words, scratch becomes one array of words and each
@@ -1209,6 +1261,9 @@ done:
    if (shader) {
       thread_memory_to_registers(shader);
       helpers_read_mapped_memory(shader);
+      uint32_t memory = target->float_add_by_swap;
+      if (memory)
+         nir_shader_intrinsics_pass(shader, swap_float_add, nir_metadata_none, &memory);
    }
    free(owned_reflection);
    return shader;
