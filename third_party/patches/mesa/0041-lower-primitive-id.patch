@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 06:58:57 +0000
+Subject: [PATCH] radv: lower a fragment shader's primitive ID given as NIR to
+ its input, as in one from SPIR-V
+
+---
+ src/amd/vulkan/radv_shader.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 1523756..0bc34c3 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -491,11 +491,12 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+       nir->options = &compiler_info->nir_options[nir->info.stage];
+       nir_validate_shader(nir, "in internal shader");
+ 
+-      /* A shader built as NIR reads the point coordinate as a system value,
+-       * as SPIR-V's does before the lowering below; ACO takes it only as the
+-       * input it lowers to. */
++      /* A shader built as NIR reads the point coordinate, and a fragment
++       * shader its primitive ID, as system values, as SPIR-V's does before
++       * the lowering below; ACO takes them only as the inputs they lower to. */
+       const struct nir_lower_sysvals_to_varyings_options point_coord = {
+          .point_coord = true,
++         .primitive_id = nir->info.stage == MESA_SHADER_FRAGMENT,
+       };
+       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &point_coord);
+       /* As the end of SPIR-V's path below: ACO takes sine and cosine only
