@@ -38,7 +38,7 @@ use super::{
         SampleCounts,
         backend::{
             Backend, BufferAllocation, Descriptor, IdleStep, MemoryBlocks, Object, Outside,
-            PreparedImport, Requirements, requirements,
+            PreparedImport, Requirements, unmet,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -715,32 +715,8 @@ impl NativeBackend {
         exporter: Box<dyn MemoryExporter>,
         kernels: impl FnOnce(vk::PhysicalDevice) -> Result<InternalKernels>,
     ) -> Result<Self> {
-        let static_fn = ash::StaticFn {
-            get_instance_proc_addr: loader.get_instance_proc_addr,
-        };
-        // SAFETY: the caller guarantees the entry point.
-        let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
-        let application = vk::ApplicationInfo::default()
-            .application_name(c"Stela Metal")
-            .engine_name(c"Stela")
-            .api_version(vk::API_VERSION_1_3);
-        // SAFETY: the caller guarantees the entry point.
-        let debug_utils =
-            unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|offered| {
-                offered
-                    .iter()
-                    .any(|offer| offer.extension_name_as_c_str() == Ok(ext::debug_utils::NAME))
-            });
-        let names = [ext::debug_utils::NAME.as_ptr()];
-        let info = vk::InstanceCreateInfo::default()
-            .application_info(&application)
-            .enabled_extension_names(if debug_utils { &names } else { &[] });
-        // SAFETY: the create info and its application info outlive the call.
-        let instance = unsafe { entry.create_instance(&info, None) }.map_err(failure)?;
-        // SAFETY: the instance enables the extension when the driver offers it.
-        let messenger = debug_utils
-            .then(|| unsafe { Messenger::new(&entry, &instance, loader.log) })
-            .flatten();
+        // SAFETY: the caller's guarantee.
+        let (entry, instance, messenger) = unsafe { Self::instance(&loader) }?;
         // SAFETY: the instance was just created and nothing else uses it.
         let destroy_instance = |instance: &ash::Instance| unsafe {
             if let Some(messenger) = &messenger {
@@ -753,16 +729,9 @@ impl NativeBackend {
             destroy_instance(&instance);
             return Err(Error::Unsupported("Vulkan device of the GPU"));
         };
-        if let Some(missing) = requirements(&snapshot.features)
-            .iter()
-            .find(|requirement| !requirement.present)
-        {
+        if let Some(missing) = unmet(&snapshot).first() {
             destroy_instance(&instance);
-            return Err(Error::Unsupported(missing.name));
-        }
-        if !snapshot.limits.dma_buf_import {
-            destroy_instance(&instance);
-            return Err(Error::Unsupported("VK_EXT_external_memory_dma_buf"));
+            return Err(Error::Unsupported(missing));
         }
 
         let mut features = FeatureChain::new(&extensions, false);
@@ -930,6 +899,69 @@ impl NativeBackend {
         backend.reorder_blocks = backend.create_compute(&kernel(kernels.reorder_blocks))?;
         backend.decode_astc = backend.create_compute(&kernel(kernels.decode_astc))?;
         Ok(backend)
+    }
+
+    /// The instance [`Self::new`] creates, with the driver's messages sent to
+    /// `loader.log` when it offers `VK_EXT_debug_utils`.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::new`].
+    unsafe fn instance(loader: &Loader) -> Result<(ash::Entry, ash::Instance, Option<Messenger>)> {
+        let static_fn = ash::StaticFn {
+            get_instance_proc_addr: loader.get_instance_proc_addr,
+        };
+        // SAFETY: the caller guarantees the entry point.
+        let entry = unsafe { ash::Entry::from_static_fn(static_fn) };
+        let application = vk::ApplicationInfo::default()
+            .application_name(c"Stela Metal")
+            .engine_name(c"Stela")
+            .api_version(vk::API_VERSION_1_3);
+        // SAFETY: the caller guarantees the entry point.
+        let debug_utils =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.is_ok_and(|offered| {
+                offered
+                    .iter()
+                    .any(|offer| offer.extension_name_as_c_str() == Ok(ext::debug_utils::NAME))
+            });
+        let names = [ext::debug_utils::NAME.as_ptr()];
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&application)
+            .enabled_extension_names(if debug_utils { &names } else { &[] });
+        // SAFETY: the create info and its application info outlive the call.
+        let instance = unsafe { entry.create_instance(&info, None) }.map_err(failure)?;
+        // SAFETY: the instance enables the extension when the driver offers it.
+        let messenger = debug_utils
+            .then(|| unsafe { Messenger::new(&entry, &instance, loader.log) })
+            .flatten();
+        Ok((entry, instance, messenger))
+    }
+
+    /// What the driver offers for the GPU at `pci`, as [`Self::new`] finds
+    /// it before it creates the device, and every requirement it lacks
+    /// ([`unmet`]); `None` when the driver offers no device there.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::new`].
+    pub unsafe fn survey(
+        loader: Loader,
+        pci: PciBusInfo,
+    ) -> Result<Option<(PhysicalDevice, Vec<&'static str>)>> {
+        // SAFETY: the caller's guarantee.
+        let (_entry, instance, messenger) = unsafe { Self::instance(&loader) }?;
+        let surveyed = Self::select(&instance, pci, loader.log).map(|(_, _, snapshot, _)| {
+            let missing = unmet(&snapshot);
+            (snapshot, missing)
+        });
+        // SAFETY: nothing else uses the instance.
+        unsafe {
+            if let Some(messenger) = &messenger {
+                messenger.destroy();
+            }
+            instance.destroy_instance(None);
+        }
+        Ok(surveyed)
     }
 
     /// The device at `pci` with a universal queue family, its supported

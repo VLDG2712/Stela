@@ -478,6 +478,18 @@ pub trait Backend {
     }
 }
 
+/// Every requirement `device` lacks, in [`requirements`]' order, then
+/// importing guest memory as dma-bufs (`VK_EXT_external_memory_dma_buf`):
+/// the device is refused for the first. Empty when it meets them all.
+pub fn unmet(device: &PhysicalDevice) -> Vec<&'static str> {
+    requirements(&device.features)
+        .iter()
+        .filter(|requirement| !requirement.present)
+        .map(|requirement| requirement.name)
+        .chain((!device.limits.dma_buf_import).then_some("VK_EXT_external_memory_dma_buf"))
+        .collect()
+}
+
 /// A Vulkan feature or extension the Metal layer needs from every device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Requirement {

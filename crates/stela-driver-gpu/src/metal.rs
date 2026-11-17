@@ -13,7 +13,6 @@
 mod macros;
 
 pub mod abi;
-#[cfg(feature = "amdgpu-port")]
 pub mod amd;
 pub mod argument;
 pub mod binding;

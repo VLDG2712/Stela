@@ -282,7 +282,7 @@ const SKIPPED: [&str; 12] = [
 ];
 /// The Metal compiler service, under `compiler`, built with the first
 /// driver's model unit's flags.
-const AIR: [&str; 16] = [
+pub(super) const AIR: [&str; 16] = [
     "air_call",
     "air_calls",
     "air_commands",

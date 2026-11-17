@@ -11,10 +11,20 @@
 //! the Metal device gives it (`amd/tests/radv_device.c`); every amdgpu ioctl
 //! RADV made must be one Stela's amdgpu registers.
 //!
+//! The same objects, with the AIR compiler built as the image builds it and
+//! linked to the Rust toolchain's LLVM 23, also make a hosted RADV library.
+//! For each device a process of its own (`metal.rs`) opens the Metal device
+//! over it as the boot does, which checks every Vulkan requirement the
+//! device has and compiles its internal kernels through ACO, and reports
+//! the Metal families it derives, or the requirement RADV lacks there, by
+//! which the GPU shows displays only. With `--corpus`, one device of each
+//! graphics generation also compiles every function of the Metal
+//! libraries given through the device's compiler and ACO.
+//!
 //! Needs what RADV's image build needs (`clc.rs`: glslang, and mesa_clc
 //! for Mesa's configuration) and the host's `libdrm.so.2`.
 use super::hosted;
-use super::nvk::{LIBDRM_VERSION, RADV};
+use super::nvk::{AIR, LIBDRM_VERSION, RADV};
 use super::support::{build_directory, gpu, slashed, third_party, tool};
 use super::toolchain::GENERATORS;
 use anyhow::{Context, Result, bail, ensure};
@@ -24,25 +34,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-/// Each device the test runs, by the shim's name for it (`AMDGPU_GPU_ID`,
-/// `amdgpu_devices.c`), what it is, and whether Vulkan must report it
-/// discrete (`true`) or integrated. The first is the owner's PC's graphics
-/// core (GC 10.3.6); the others cover each ACO generation from GFX8.
-const DEVICES: [(&str, &str, bool); 9] = [
-    (
-        "raphael_mendocino",
-        "Ryzen 7000/9000 graphics, GFX10.3",
-        false,
-    ),
-    ("rembrandt", "Ryzen 6000 graphics, GFX10.3", false),
-    ("phoenix", "Ryzen 7040 graphics, GFX11", false),
-    ("strix1", "Ryzen AI 300 graphics, GFX11.5", false),
-    ("renoir", "Ryzen 4000 graphics, GFX9", false),
-    ("navi21", "Radeon RX 6800/6900, GFX10.3", true),
-    ("navi31", "Radeon RX 7900, GFX11", true),
-    ("gfx1201", "Radeon RX 9070, GFX12", true),
-    ("polaris10", "Radeon RX 480/580, GFX8", true),
-];
+/// The owner's PC's graphics core (GC 10.3.6), which the test runs first;
+/// the others are every chip RADV creates a device for (`devices.rs`).
+const FIRST: &str = "raphael_mendocino";
 /// The program's exit line naming the amdgpu ioctls RADV made.
 const USED: &str = "amdgpu ioctls:";
 /// Mesa's amdgpu no-op shim library, whose link the test runs itself: the
@@ -50,7 +44,12 @@ const USED: &str = "amdgpu ioctls:";
 /// undefined.
 const SHIM: &str = "src/amd/drm-shim/libamdgpu_noop_drm_shim.so";
 
-pub fn test(jobs: u16) -> Result<()> {
+mod devices;
+mod metal;
+pub use metal::run as metal;
+
+pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
+    let corpus = libraries(corpus)?;
     let directory = build_directory("radv-host");
     let build = directory.join("build");
     let output = directory.join("test");
@@ -119,15 +118,34 @@ pub fn test(jobs: u16) -> Result<()> {
         "AMDGPU_",
     );
     ensure!(!registered.is_empty(), "amdgpu_drv.c registers no ioctl");
+    let devices = devices::devices(&shim_sources()?, FIRST)?;
     let shim = output.join("libamdgpu_noop_drm_shim.so");
-    let words = hosted::preloaded_link(&shim_link, &shim);
+    let [table, start] = shim_table(&build, &output, &devices)?;
+    let mut words = hosted::preloaded_link(&shim_link, &shim);
+    for (unit, object) in [
+        ("_common_amdgpu_devices.c.o", table),
+        ("/amdgpu_noop_drm_shim.c.o", start),
+    ] {
+        let replaced = words
+            .iter_mut()
+            .find(|word| word.ends_with(unit))
+            .with_context(|| format!("the shim's link has no {unit}"))?;
+        *replaced = object.display().to_string();
+    }
     crate::tools::exec(
         Command::new(&words[0])
             .current_dir(&build)
             .args(&words[1..]),
     )?;
+    let llvm = air_llvm()?;
+    let library = link_library(&build, &output, &link, &llvm)?;
     let mut failures = Vec::new();
-    for (device, name, discrete) in DEVICES {
+    let mut opened = 0;
+    let mut classes = Vec::new();
+    let sweeps = sweep_devices(&devices);
+    for shim_device in &devices {
+        let (device, discrete) = (shim_device.name.as_str(), shim_device.discrete);
+        let name = shim_device.description();
         let run = Command::new("timeout")
             .arg("120")
             .arg(&program)
@@ -161,6 +179,26 @@ pub fn test(jobs: u16) -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                // The corpus runs on one device of each generation.
+                let sweep = !corpus.is_empty() && sweeps.contains(&device);
+                match open_metal(
+                    &library,
+                    &shim,
+                    device,
+                    if sweep { &corpus } else { &[] },
+                    &output,
+                ) {
+                    Ok(Opened::Metal(lines)) => {
+                        opened += 1;
+                        // A display-only generation compiles nothing.
+                        if sweep {
+                            classes.push(shim_device.level.as_str());
+                        }
+                        lines.iter().for_each(|line| println!("  {line}"));
+                    }
+                    Ok(Opened::DisplayOnly(line)) => println!("  {line}"),
+                    Err(error) => failures.push(format!("{device} ({name}): {error:#}")),
+                }
             }
             (true, _, false) => failures.push(format!(
                 "{device} ({name}): RADV used ioctls Stela's amdgpu does not register: {}",
@@ -180,10 +218,379 @@ pub fn test(jobs: u16) -> Result<()> {
         failures.join("\n")
     );
     println!(
-        "RADV ran on amdgpu's ioctls for {} devices, with no GPU",
-        DEVICES.len()
+        "RADV ran on amdgpu's ioctls for {} devices, with no GPU; the Metal device opened on {opened} \
+         of them{}",
+        devices.len(),
+        if corpus.is_empty() {
+            String::from(", no Metal libraries given to compile")
+        } else {
+            format!(
+                ", and compiled {} Metal libraries on {} generations",
+                corpus.len(),
+                classes.len()
+            )
+        }
     );
     Ok(())
+}
+
+/// What the Metal device did on a device.
+enum Opened {
+    /// It opened: its report, the corpus's included.
+    Metal(Vec<String>),
+    /// RADV lacks a requirement: the GPU shows displays only.
+    DisplayOnly(String),
+}
+
+/// Runs `metal.rs` in a process of its own over the shim showing `device`,
+/// then once for each of the Metal libraries `corpus`, so that a library
+/// that stops its process is reported and the others still compile; the
+/// logs go beside the program's.
+fn open_metal(
+    library: &Path,
+    shim: &Path,
+    device: &str,
+    corpus: &[PathBuf],
+    output: &Path,
+) -> Result<Opened> {
+    let child = |corpus: Option<&Path>, log: &Path| -> Result<String> {
+        let run = Command::new("timeout")
+            .arg(if corpus.is_none() { "300" } else { "1800" })
+            .arg(std::env::current_exe()?)
+            .args(["gpu", "radv-metal"])
+            .arg(library)
+            .args(corpus)
+            .env("LD_PRELOAD", shim)
+            .env("AMDGPU_GPU_ID", device)
+            .stdin(Stdio::null())
+            .output()?;
+        let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        fs::write(log, format!("{stdout}{stderr}"))?;
+        let building = stderr
+            .lines()
+            .rev()
+            .find_map(|line| line.trim_start().strip_prefix("building "))
+            .map(|function| format!(" building {function}"))
+            .unwrap_or_default();
+        ensure!(
+            run.status.success(),
+            "the Metal device's process failed with {}{building} (log {})",
+            run.status,
+            log.display()
+        );
+        Ok(stdout)
+    };
+    let stdout = child(None, &output.join(format!("{device}.metal.log")))?;
+    if let Some(line) = stdout.lines().find(|line| line.starts_with(metal::REFUSED)) {
+        return Ok(Opened::DisplayOnly(line.to_owned()));
+    }
+    let mut lines: Vec<String> = stdout
+        .lines()
+        .filter(|line| line.starts_with(metal::OPENED))
+        .map(str::to_owned)
+        .collect();
+    ensure!(
+        !lines.is_empty(),
+        "the Metal device's process reported nothing"
+    );
+    let mut total = Corpus::default();
+    let mut failed = Vec::new();
+    for path in corpus {
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let log = output.join(format!("{device}.{name}.metal.log"));
+        match child(Some(path), &log) {
+            Ok(stdout) => {
+                let counted = stdout.lines().find_map(Corpus::parse);
+                total.add(&counted.with_context(|| format!("{name} reported no corpus line"))?);
+                lines.extend(
+                    stdout
+                        .lines()
+                        .filter(|line| line.starts_with("  refused "))
+                        .map(|line| format!("{name}:{}", line.trim_start_matches(' '))),
+                );
+            }
+            Err(error) => failed.push(format!("{name}: {error:#}")),
+        }
+    }
+    if !corpus.is_empty() {
+        lines.push(total.line());
+    }
+    ensure!(
+        failed.is_empty(),
+        "the corpus stopped compiling: {}",
+        failed.join("; ")
+    );
+    Ok(Opened::Metal(lines))
+}
+
+/// A corpus line's counts (`metal::CORPUS`).
+#[derive(Debug, Default, PartialEq)]
+struct Corpus {
+    functions: usize,
+    compute: usize,
+    graphics: usize,
+    refused: usize,
+    skipped: usize,
+    /// Kernels the driver built again from its cache's data alone.
+    cached: usize,
+}
+
+impl Corpus {
+    fn parse(line: &str) -> Option<Self> {
+        let numbers: Vec<usize> = line
+            .strip_prefix(metal::CORPUS)?
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|word| !word.is_empty())
+            .map(|word| word.parse().ok())
+            .collect::<Option<_>>()?;
+        let [
+            functions,
+            _,
+            compute,
+            graphics,
+            refused,
+            skipped,
+            cached,
+            kernels,
+        ] = numbers[..]
+        else {
+            return None;
+        };
+        (kernels == compute).then_some(Self {
+            functions,
+            compute,
+            graphics,
+            refused,
+            skipped,
+            cached,
+        })
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.functions += other.functions;
+        self.compute += other.compute;
+        self.graphics += other.graphics;
+        self.refused += other.refused;
+        self.skipped += other.skipped;
+        self.cached += other.cached;
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "{} {} functions, {} pipelines built by ACO ({} compute, {} graphics), {} refused, \
+             {} skipped, {} of {} kernels built again from the driver's cache data alone",
+            metal::CORPUS,
+            self.functions,
+            self.compute + self.graphics,
+            self.compute,
+            self.graphics,
+            self.refused,
+            self.skipped,
+            self.cached,
+            self.compute
+        )
+    }
+}
+
+/// The device of each graphics generation the corpus compiles on: its
+/// first recorded one, else its first.
+fn sweep_devices(devices: &[devices::ShimDevice]) -> Vec<&str> {
+    let mut levels: Vec<&str> = Vec::new();
+    for device in devices {
+        if !levels.contains(&device.level.as_str()) {
+            levels.push(&device.level);
+        }
+    }
+    levels
+        .into_iter()
+        .filter_map(|level| {
+            let mut of_level = devices.iter().filter(|device| device.level == level);
+            let first = of_level.clone().next()?;
+            Some(
+                of_level
+                    .find(|device| device.derived.is_none())
+                    .unwrap_or(first)
+                    .name
+                    .as_str(),
+            )
+        })
+        .collect()
+}
+
+/// The sources `devices.rs` reads.
+fn shim_sources() -> Result<devices::Sources> {
+    let mesa = third_party("mesa").join("src/amd");
+    let read = |path: PathBuf| {
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+    };
+    Ok(devices::Sources {
+        families: read(mesa.join("common/amd_family.h"))?,
+        levels: read(mesa.join("common/amd_family.c"))?,
+        identify: read(mesa.join("common/ac_gpu_info.c"))?,
+        ranges: read(mesa.join("addrlib/src/amdgpu_asic_addr.h"))?,
+        records: read(mesa.join("common/amdgpu_devices.c"))?,
+        ids: read(third_party("linux").join("drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c"))?,
+    })
+}
+
+/// Compiles the shim's device table with the devices derived from
+/// recorded siblings (`amd/tests/radv_shim_devices.c`), which fills it as
+/// the shim starts its device, and the shim's own start under the name the
+/// table calls; their objects.
+fn shim_table(
+    build: &Path,
+    output: &Path,
+    devices: &[devices::ShimDevice],
+) -> Result<[PathBuf; 2]> {
+    let generated = output.join("shim");
+    fs::create_dir_all(&generated)?;
+    fs::write(
+        generated.join("radv_shim_derived.h"),
+        devices::derived_header(devices)?,
+    )?;
+    let object = generated.join("radv_shim_devices.o");
+    crate::tools::exec(
+        hosted::compile_command(
+            build,
+            "amd/common/amdgpu_devices.c",
+            &gpu().join("amd/tests/radv_shim_devices.c"),
+            &object,
+        )?
+        .arg(format!("-I{}", generated.display())),
+    )?;
+    let start = generated.join("amdgpu_noop_drm_shim.o");
+    crate::tools::exec(
+        hosted::compile_command(
+            build,
+            "amd/drm-shim/amdgpu_noop_drm_shim.c",
+            &third_party("mesa").join("src/amd/drm-shim/amdgpu_noop_drm_shim.c"),
+            &start,
+        )?
+        .arg("-Ddrm_shim_driver_init=stela_mesa_drm_shim_driver_init"),
+    )?;
+    Ok([object, start])
+}
+
+/// The Metal libraries of `paths`: each file, and each `.metallib` under a
+/// directory, in order.
+fn libraries(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut entries: Vec<PathBuf> = fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<_>>()?;
+            entries.sort();
+            found.extend(entries.into_iter().filter(|entry| {
+                entry
+                    .extension()
+                    .is_some_and(|extension| extension == "metallib")
+            }));
+        } else {
+            ensure!(path.is_file(), "{} is no Metal library", path.display());
+            found.push(path.clone());
+        }
+    }
+    Ok(found)
+}
+
+/// The LLVM 23 shared library of the Rust toolchain building this task,
+/// whose C interface the AIR compiler links on the host as it links the
+/// image's LLVM.
+fn air_llvm() -> Result<PathBuf> {
+    let sysroot = PathBuf::from(
+        super::support::capture(Command::new("rustc").args(["--print", "sysroot"]))?.trim(),
+    );
+    let directory = sysroot.join("lib");
+    fs::read_dir(&directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libLLVM.so.23"))
+        })
+        .with_context(|| format!("the Rust toolchain at {} has no LLVM 23", sysroot.display()))
+}
+
+/// Builds the hosted RADV library: the driver's objects as Mesa links them,
+/// with the image's stand-ins, libdrm_amdgpu from its sources, the AIR
+/// compiler built as the image builds it, and `radv_host.c`; its path.
+fn link_library(build: &Path, output: &Path, link: &[String], llvm: &Path) -> Result<PathBuf> {
+    let sources = gpu();
+    let objects_directory = output.join("library");
+    fs::create_dir_all(&objects_directory)?;
+    let libc = format!("-idirafter{}", sources.join("compat/libc").display());
+    let exported = "-fvisibility=default".to_owned();
+    let mut units = vec![
+        (
+            sources.join("compat/mesa/radv_nir_options.c"),
+            vec!["-Wno-missing-prototypes".to_owned(), exported.clone()],
+        ),
+        (
+            sources.join("compat/mesa/drm.c"),
+            vec![libc.clone(), exported.clone(), "-Wno-vla".to_owned()],
+        ),
+        (
+            sources.join("amd/tests/radv_host.c"),
+            vec![libc, exported.clone()],
+        ),
+    ];
+    for library in RADV.libraries {
+        let defines: Vec<String> = library
+            .defines
+            .iter()
+            .map(|define| format!("-D{define}"))
+            .collect();
+        units.extend(
+            library
+                .sources
+                .iter()
+                .map(|source| (third_party(source), defines.clone())),
+        );
+    }
+    let compiler = sources.join("compiler");
+    let includes: Vec<String> = [
+        compiler.clone(),
+        compiler.join("llvm/include"),
+        third_party("llvm").join("llvm/include"),
+        sources.clone(),
+    ]
+    .iter()
+    .map(|include| format!("-I{}", include.display()))
+    .chain([
+        exported,
+        "-Wno-missing-prototypes".to_owned(),
+        "-Wno-vla".to_owned(),
+    ])
+    .collect();
+    units.extend(
+        AIR.iter()
+            .map(|name| (compiler.join(format!("{name}.c")), includes.clone())),
+    );
+    let mut objects = Vec::new();
+    for (source, flags) in units {
+        let object = objects_directory.join(
+            source
+                .with_extension("o")
+                .file_name()
+                .context("unit name")?,
+        );
+        crate::tools::exec(
+            hosted::compile_command(build, RADV.model, &source, &object)?.args(flags),
+        )?;
+        objects.push(object);
+    }
+    let library = output.join("libstela_radv_host.so");
+    let directory = llvm.parent().context("LLVM's directory")?;
+    let extra = [
+        llvm.display().to_string(),
+        format!("-Wl,-rpath,{}", directory.display()),
+        hosted::host_libdrm()?.display().to_string(),
+    ];
+    let words = hosted::library_link(link, &library, &objects, &extra);
+    crate::tools::exec(Command::new(&words[0]).current_dir(build).args(&words[1..]))?;
+    Ok(library)
 }
 
 /// Builds the test program; its path.
@@ -268,13 +675,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_devices_are_distinct_and_the_owners_core_comes_first() {
-        assert_eq!(DEVICES[0].0, "raphael_mendocino");
-        for (index, (device, _, _)) in DEVICES.iter().enumerate() {
-            assert!(DEVICES[..index].iter().all(|(other, _, _)| other != device));
-        }
-        assert!(DEVICES.iter().any(|&(_, _, discrete)| discrete));
-        assert!(DEVICES.iter().any(|&(_, _, discrete)| !discrete));
+    fn corpus_lines_read_back_and_add_up() {
+        let one = Corpus {
+            functions: 9,
+            compute: 3,
+            graphics: 4,
+            refused: 1,
+            skipped: 1,
+            cached: 3,
+        };
+        assert_eq!(Corpus::parse(&one.line()), Some(one));
+        let mut total = Corpus::parse(
+            &Corpus {
+                functions: 2,
+                ..Corpus::default()
+            }
+            .line(),
+        )
+        .unwrap();
+        total.add(&Corpus {
+            functions: 9,
+            compute: 3,
+            graphics: 4,
+            refused: 1,
+            skipped: 1,
+            cached: 2,
+        });
+        assert_eq!((total.functions, total.cached), (11, 2));
+        assert_eq!(Corpus::parse("Metal corpus: 3 functions"), None);
+        assert_eq!(Corpus::parse("something else 1 2 3 4 5 6"), None);
+    }
+
+    #[test]
+    fn the_corpus_compiles_on_a_recorded_device_of_each_generation() {
+        let device = |name: &str, level: &str, derived: bool| devices::ShimDevice {
+            name: name.to_owned(),
+            chip: name.to_uppercase(),
+            level: level.to_owned(),
+            note: String::new(),
+            discrete: true,
+            derived: derived.then(|| devices::Derived {
+                base: String::from("base"),
+                family: 0,
+                external_rev: 0,
+                device_id: 0,
+                version: None,
+            }),
+        };
+        let devices = [
+            device("tahiti", "GFX6", true),
+            device("pitcairn", "GFX6", false),
+            device("gfx1170", "GFX11_7", true),
+            device("navi21", "GFX10_3", false),
+            device("navi22", "GFX10_3", true),
+        ];
+        assert_eq!(sweep_devices(&devices), ["pitcairn", "gfx1170", "navi21"]);
     }
 
     #[test]

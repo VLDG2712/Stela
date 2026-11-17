@@ -118,10 +118,27 @@ pub enum Command {
     /// compute pipeline and one submission per device of the test, through
     /// Stela's libdrm stand-in and libdrm_amdgpu, each amdgpu ioctl checked
     /// against Stela's amdgpu.
+    ///
+    /// Each device then opens the Metal device over the same RADV in a
+    /// process of its own, which checks every Vulkan requirement the device
+    /// has; the first device of each graphics generation also compiles the
+    /// Metal libraries given through ACO.
     RadvTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
+        /// Metal libraries (`.metallib` files, or directories of them) to
+        /// compile function by function through the device's compiler and
+        /// ACO. They are Apple compiler output and never committed.
+        #[arg(long)]
+        corpus: Vec<PathBuf>,
+    },
+    /// The Metal device over the hosted RADV library LIBRARY, in the process
+    /// `radv-test` starts for one device under the amdgpu DRM shim.
+    #[command(hide = true)]
+    RadvMetal {
+        library: PathBuf,
+        corpus: Vec<PathBuf>,
     },
     /// Differential testing of the Metal stack: plan the suite's assertions,
     /// prove them on a Mac, carry them to a guest and check its results.
@@ -166,7 +183,10 @@ pub fn run(command: Command) -> Result<()> {
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
         Command::AnvTest { jobs } => anv::test(jobs),
-        Command::RadvTest { jobs } => radv::test(jobs),
+        Command::RadvTest { jobs, corpus } => radv::test(jobs, &corpus),
+        Command::RadvMetal { library, corpus } => {
+            radv::metal(&library, &support::third_party("linux"), &corpus)
+        }
         Command::MetalSuite(command) => metal_suite::run(command),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::discover()?, jobs, test),
     }

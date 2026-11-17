@@ -32,9 +32,12 @@ fn attachment(external: bool) -> Attachment {
     }
 }
 
-/// GC 10.3.6, the graphics of Ryzen 7000 and 9000 processors.
+/// GC 10.3.6, the graphics of Ryzen 7000 and 9000 processors, and its name
+/// in amdgpu's interface.
 const RAPHAEL: u32 = 149;
+const NAME: Option<&str> = Some("GC_10_3_6");
 
+#[cfg(feature = "amdgpu-port")]
 #[test]
 fn an_integrated_gpu_is_built_in_with_amdgpus_family_name() {
     let platform = admit_family(
@@ -56,9 +59,10 @@ fn an_integrated_gpu_is_built_in_with_amdgpus_family_name() {
 #[test]
 fn a_discrete_gpu_reports_its_link_and_where_it_is() {
     let navi = 143;
-    let slot = admit_family(
+    let slot = admit_named(
         &radv(PhysicalDeviceType::DiscreteGpu),
         navi,
+        Some("NV"),
         attachment(false),
     )
     .unwrap();
@@ -68,9 +72,10 @@ fn a_discrete_gpu_reports_its_link_and_where_it_is() {
         slot.max_transfer_rate,
         attachment(false).link.bytes_per_second()
     );
-    let external = admit_family(
+    let external = admit_named(
         &radv(PhysicalDeviceType::DiscreteGpu),
         navi,
+        Some("NV"),
         attachment(true),
     )
     .unwrap();
@@ -83,21 +88,31 @@ fn other_vendors_drivers_families_and_devices_are_refused() {
     let mut nvidia = radv(PhysicalDeviceType::DiscreteGpu);
     nvidia.vendor_id = 0x10de;
     assert_eq!(
-        admit_family(&nvidia, RAPHAEL, attachment(false)),
+        admit_named(&nvidia, RAPHAEL, NAME, attachment(false)),
         Err(Refusal::NotAmd { vendor_id: 0x10de })
     );
     let mut venus = radv(PhysicalDeviceType::DiscreteGpu);
     venus.driver_id = DriverId::MesaVenus;
     assert_eq!(
-        admit_family(&venus, RAPHAEL, attachment(false)),
+        admit_named(&venus, RAPHAEL, NAME, attachment(false)),
         Err(Refusal::NotRadv(DriverId::MesaVenus))
     );
     assert_eq!(
-        admit_family(&radv(PhysicalDeviceType::DiscreteGpu), 0, attachment(false)),
+        admit_named(
+            &radv(PhysicalDeviceType::DiscreteGpu),
+            0,
+            None,
+            attachment(false)
+        ),
         Err(Refusal::UnknownFamily { family: 0 })
     );
     assert_eq!(
-        admit_family(&radv(PhysicalDeviceType::Cpu), RAPHAEL, attachment(false)),
+        admit_named(
+            &radv(PhysicalDeviceType::Cpu),
+            RAPHAEL,
+            NAME,
+            attachment(false)
+        ),
         Err(Refusal::NotGpu(PhysicalDeviceType::Cpu))
     );
 }

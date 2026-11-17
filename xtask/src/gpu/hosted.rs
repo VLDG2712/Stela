@@ -178,6 +178,37 @@ pub(super) fn program_link(
     words
 }
 
+/// The driver's link made a shared library of the test's own at `library`:
+/// its objects first, then the driver's inputs, without Mesa's export list
+/// and name, so every symbol the test's objects export stays visible, then
+/// `extra`.
+pub(super) fn library_link(
+    link: &[String],
+    library: &Path,
+    objects: &[PathBuf],
+    extra: &[String],
+) -> Vec<String> {
+    let mut words = vec![link[0].clone(), "-shared".into(), "-o".into()];
+    words.push(library.display().to_string());
+    words.extend(objects.iter().map(|object| object.display().to_string()));
+    let mut skip = false;
+    for word in &link[1..] {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        match word.as_str() {
+            "-o" | "-Wl,--version-script" => skip = true,
+            "-shared" | "-Wl,--as-needed" => {}
+            other
+                if other.starts_with("-Wl,-soname")
+                    || other.starts_with("-Wl,--version-script=") => {}
+            _ => words.push(word.clone()),
+        }
+    }
+    words.extend(extra.iter().cloned());
+    words
+}
+
 /// A preloaded shim library's link, Meson's with its output at `library`
 /// and undefined symbols allowed: the shim's libdrm calls resolve in the
 /// test program, whose libdrm stand-in is exported.
@@ -302,6 +333,45 @@ mod tests {
             built_inputs(&link),
             ["x.o", "a.a"],
             "only what the build makes"
+        );
+    }
+
+    #[test]
+    fn a_hosted_library_keeps_its_exports_and_the_drivers_inputs() {
+        let link: Vec<String> = [
+            "cc",
+            "-o",
+            "src/amd/vulkan/libvulkan_radeon.so",
+            "-shared",
+            "-Wl,-soname,libvulkan_radeon.so",
+            "-Wl,--version-script",
+            "vulkan.sym",
+            "-Wl,--as-needed",
+            "-Wl,--no-undefined",
+            "src/amd/vulkan/libvulkan_radeon.so.p/radv_device.c.o",
+            "src/util/libmesa_util.a",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let words = library_link(
+            &link,
+            Path::new("/t/libhost.so"),
+            &[PathBuf::from("/t/own.o")],
+            &["-lllvm".to_owned()],
+        );
+        assert_eq!(
+            words,
+            [
+                "cc",
+                "-shared",
+                "-o",
+                "/t/libhost.so",
+                "/t/own.o",
+                "-Wl,--no-undefined",
+                "src/amd/vulkan/libvulkan_radeon.so.p/radv_device.c.o",
+                "src/util/libmesa_util.a",
+                "-lllvm",
+            ]
         );
     }
 
