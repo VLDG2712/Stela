@@ -36,9 +36,6 @@ metal = ["dep:stela-contracts"]
 metal-vulkan = ["metal", "dep:ash"]
 # The image links the Metal compiler's C (`crates/stela-mesa`).
 metal-linked = ["metal-vulkan"]
-# AMD's stack draws on RADV, which the image must link (`stela_vulkan_amd`);
-# without it amdgpu shows frames another GPU drew.
-radv = ["amdgpu-port", "metal-linked"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", optional = true }

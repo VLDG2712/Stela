@@ -98,6 +98,12 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
             "--features",
             "metal-linked,nouveau-port",
         ]),
+        uefi([
+            "-p",
+            "stela-driver-gpu",
+            "--features",
+            "metal-linked,nouveau-port,amdgpu-port",
+        ]),
     ];
     let mut nvk_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk"]);
     // Mesa's unchanged path crates declare their upstream naming lint
@@ -105,13 +111,18 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
     // Stela's driver owners are checked separately above.
     nvk_clippy.env("RUSTFLAGS", BOOT_RUSTFLAGS);
     boot_lane.push(nvk_clippy);
+    // A development image's drivers, with the AMD port a release leaves out
+    // (`boot::linked_features`).
+    let mut ports_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk,amdgpu"]);
+    ports_clippy.env("RUSTFLAGS", BOOT_RUSTFLAGS);
+    boot_lane.push(ports_clippy);
     let mut linked = command([
         "build",
         "--locked",
         "--manifest-path",
         BOOT_MANIFEST,
         "--features",
-        "nvk",
+        crate::boot::linked_features(crate::tools::release_build()),
         "--target",
         BOOT_TARGET,
         "--target-dir",

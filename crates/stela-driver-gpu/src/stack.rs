@@ -142,9 +142,11 @@ pub static NVIDIA: GpuStack = GpuStack {
     vulkan: Some(crate::metal::nvidia::DRIVER),
 };
 
-/// amdgpu with its display core, and RADV's admission. RADV is its Vulkan
-/// driver in an image built with `radv` ([`AMD_VULKAN`]); in any other its
-/// GPU shows the frames another GPU draws, on the displays wired to it.
+/// amdgpu with its display core, RADV's admission and RADV, with ACO, as
+/// its Vulkan driver when the image holds it ([`AMD_VULKAN`]). Whether its
+/// GPU serves the Metal device is [`metal_devices`]' choice; otherwise, or
+/// in an image built without RADV's tools, it shows the frames another GPU
+/// draws on the displays wired to it.
 #[cfg(feature = "amdgpu-port")]
 pub static AMD: GpuStack = GpuStack {
     vendor: Vendor::Amd,
@@ -178,15 +180,20 @@ pub static AMD: GpuStack = GpuStack {
     vulkan: AMD_VULKAN,
 };
 
-/// RADV, in an image built with `radv`, whose build links it.
-#[cfg(all(feature = "amdgpu-port", feature = "radv", not(test), stela_vulkan_amd))]
-const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd::DRIVER);
-/// No Vulkan driver: an image built without `radv`.
+/// RADV, in an image whose Mesa build holds it.
 #[cfg(all(
     feature = "amdgpu-port",
     feature = "metal-linked",
     not(test),
-    not(all(feature = "radv", stela_vulkan_amd))
+    stela_vulkan_amd
+))]
+const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd::DRIVER);
+/// No Vulkan driver: an image built where RADV's tools were missing.
+#[cfg(all(
+    feature = "amdgpu-port",
+    feature = "metal-linked",
+    not(test),
+    not(stela_vulkan_amd)
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = None;
 

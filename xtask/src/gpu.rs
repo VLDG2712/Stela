@@ -203,16 +203,3 @@ pub fn build_nvk(jobs: u16) -> Result<()> {
     nvk::build(jobs)?;
     crate::guest::run()
 }
-
-/// Fails unless the last `gpu nvk` linked the Vulkan driver `name` (Meson's
-/// name for it), which needs the build host's tools (`clc.rs`).
-pub fn require_vulkan_driver(name: &str) -> Result<()> {
-    let list = support::build_directory("nvk").join(nvk::LINKED);
-    let linked = std::fs::read_to_string(&list).unwrap_or_default();
-    anyhow::ensure!(
-        linked.lines().any(|linked| linked == name),
-        "Vulkan driver {name} is not built: `cargo xtask gpu nvk` says why ({})",
-        list.display()
-    );
-    Ok(())
-}

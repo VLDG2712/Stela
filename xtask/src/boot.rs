@@ -115,22 +115,15 @@ enum Scenario {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Build `stela.efi` with its NVK GPU stack and guest components.
+    /// Build `stela.efi` with its GPU stacks and guest components: NVK
+    /// over nouveau, and, outside a release, amdgpu, whose GPUs draw on
+    /// RADV where the image's Mesa build holds it ([`linked_features`]).
     Build {
         #[arg(long)]
         release: bool,
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
-        /// Carry amdgpu beside nouveau and the image's Mesa drivers, for a
-        /// Radeon RX 9070 (Navi 48) or RX 6800-6950 XT (Navi 21): amdgpu
-        /// binds it in the Linux environment.
-        #[arg(long, conflicts_with = "radv")]
-        amdgpu: bool,
-        /// Carry amdgpu and require RADV among the image's Mesa drivers:
-        /// amdgpu binds the GPU and RADV backs the Metal device over it.
-        #[arg(long)]
-        radv: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -507,20 +500,13 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::Build {
             release,
             diagnostics,
-            amdgpu,
-            radv,
         } => {
             crate::gpu::fetch::fetch(false)?;
             crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            let gpu = if radv {
-                crate::gpu::require_vulkan_driver("amd")?;
-                Gpu::Radv
-            } else if amdgpu {
-                Gpu::Amdgpu
-            } else {
-                Gpu::Nvk
-            };
-            println!("{}", build_for_boot(release, diagnostics, gpu)?.display());
+            println!(
+                "{}",
+                build_for_boot(release, diagnostics, Gpu::Linked)?.display()
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(arguments) => launch(*arguments),
@@ -529,7 +515,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
 
 pub fn build(release: bool) -> Result<PathBuf> {
     crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, Gpu::Nvk)
+    build_with_diagnostics(release, false, Gpu::Linked)
 }
 
 /// The GPU drivers a `stela.efi` carries beyond its Linux environment.
@@ -537,13 +523,17 @@ pub fn build(release: bool) -> Result<PathBuf> {
 enum Gpu {
     /// None: nouveau binds nothing without NVK.
     None,
-    /// NVK, NIR and NAK over nouveau, from `cargo xtask gpu nvk`.
-    Nvk,
-    /// amdgpu beside NVK: the GPU claims run in an image with the Mesa
-    /// drivers.
-    Amdgpu,
-    /// amdgpu with RADV, ACO and NIR among the image's Mesa drivers.
-    Radv,
+    /// The image's Mesa drivers and kernel drivers ([`linked_features`]).
+    Linked,
+}
+
+/// stela-boot's features for an image with its Mesa drivers: NVK over
+/// nouveau, and, outside a release, amdgpu. Which GPUs draw is then the
+/// image's own detection: AMD's stack gives RADV where `gpu nvk` built it
+/// (`stela_vulkan_amd`), and otherwise its GPUs show frames another GPU
+/// draws. A release leaves the AMD port and its firmware out.
+pub(crate) fn linked_features(release: bool) -> &'static str {
+    if release { "nvk" } else { "nvk,amdgpu" }
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -584,14 +574,8 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
     }
     match gpu {
         Gpu::None => {}
-        Gpu::Nvk => {
-            command.args(["--features", "nvk"]);
-        }
-        Gpu::Amdgpu => {
-            command.args(["--features", "nvk,amdgpu"]);
-        }
-        Gpu::Radv => {
-            command.args(["--features", "radv"]);
+        Gpu::Linked => {
+            command.args(["--features", linked_features(crate::tools::release_build())]);
         }
     }
     if release {

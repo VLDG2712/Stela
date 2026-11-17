@@ -30,12 +30,12 @@ const ETIME: i64 = -62;
 
 /// An ioctl argument's first bytes as the caller passed them: the kernel
 /// writes its answer over the same structure. Only amdgpu's are decoded.
-#[cfg_attr(not(feature = "radv"), allow(dead_code))]
+#[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
 pub(super) struct Input {
     bytes: [u8; KEPT],
 }
 
-#[cfg_attr(not(feature = "radv"), allow(dead_code))]
+#[cfg_attr(not(feature = "amdgpu"), allow(dead_code))]
 impl Input {
     fn u32(&self, at: usize) -> u32 {
         u32::from_le_bytes(self.bytes[at..at + 4].try_into().expect("four bytes"))
@@ -191,7 +191,7 @@ fn name(number: u32) -> Option<&'static str> {
     })
 }
 
-#[cfg(feature = "radv")]
+#[cfg(feature = "amdgpu")]
 fn driver(command: u32) -> Option<&'static str> {
     Some(match command {
         0x00 => "AMDGPU_GEM_CREATE",
@@ -214,14 +214,14 @@ fn driver(command: u32) -> Option<&'static str> {
     })
 }
 
-#[cfg(not(feature = "radv"))]
+#[cfg(not(feature = "amdgpu"))]
 fn driver(_: u32) -> Option<&'static str> {
     None
 }
 
 /// What the call asked for, for the driver commands whose refusal a Vulkan
 /// driver reports as out of memory, written after a space each.
-#[cfg(feature = "radv")]
+#[cfg(feature = "amdgpu")]
 fn describe(number: u32, input: &Input, out: &mut alloc::string::String) {
     use core::fmt::Write;
     let Some(command) = number.checked_sub(COMMAND_BASE) else {
@@ -284,5 +284,5 @@ fn describe(number: u32, input: &Input, out: &mut alloc::string::String) {
     };
 }
 
-#[cfg(not(feature = "radv"))]
+#[cfg(not(feature = "amdgpu"))]
 fn describe(_: u32, _: &Input, _: &mut alloc::string::String) {}
