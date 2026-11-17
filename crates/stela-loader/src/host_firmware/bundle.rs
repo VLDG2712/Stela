@@ -22,7 +22,7 @@ pub const DIRECTORY: &str = "stela/firmware";
 /// The bundle's manifest on its volume.
 pub const MANIFEST: &str = "stela/firmware/bundle.json";
 /// At most this many files and as many notices.
-pub const MAX_OBJECTS: usize = 256;
+pub const MAX_OBJECTS: usize = 1024;
 /// The target a bundle file has in the boot's catalog, under the name
 /// [`name`] gives its digest. Only [`BundleProvider`] asks for it.
 pub const TARGET: driver::Target<'static> = driver::Target {
@@ -254,7 +254,7 @@ pub fn complete() -> Vec<(&'static Artifact, &'static Artifact)> {
 impl<'a> Bundle<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(fail("host firmware bundle manifest exceeds 128 KiB"));
+            return Err(fail("host firmware bundle manifest exceeds 1 MiB"));
         }
         let bundle: Self = serde_json::from_slice(bytes)
             .map_err(|e| Error(format!("host firmware bundle manifest: {e}")))?;
@@ -435,10 +435,10 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             if !ports.amd {
                 continue;
             }
+            // The files amdgpu may ask this device for; a device it leaves
+            // to an older driver has none.
             if recipes::require_amdgpu(&mut inventory, function.device).is_ok() {
                 selection.plan(&inventory, &why);
-            } else if !selection.unknown.contains(&why) {
-                selection.unknown.push(why.clone());
             }
             continue;
         }

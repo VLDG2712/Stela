@@ -16,6 +16,9 @@ use uefi::{
     proto::media::{file::Directory, fs::SimpleFileSystem},
 };
 
+/// More files than this for one device are logged as one line.
+const SUMMARIZED: usize = 16;
+
 /// The files read from the bundle, in the order of their regions.
 pub struct Bundled {
     bundle: Bundle<'static>,
@@ -125,6 +128,17 @@ fn load_from(
         regions: Vec::new(),
         bundle: parsed,
     };
+    // A device that may ask for many files (an AMD GPU amdgpu identifies by
+    // IP discovery) gets one line for the files read, not one each.
+    let many = |why: &str| {
+        selection
+            .wanted
+            .iter()
+            .filter(|(_, wanted)| wanted == why)
+            .count()
+            > SUMMARIZED
+    };
+    let mut summaries: Vec<(&str, usize, usize)> = Vec::new();
     let mut lacking = 0;
     for (artifact, why) in &selection.wanted {
         let Some(index) = bundled
@@ -149,10 +163,17 @@ fn load_from(
         };
         match read {
             Ok(region) => {
-                output::arguments(format_args!(
-                    "HOST FIRMWARE BUNDLE USE {} bytes={} for {why}\n",
-                    object.member, object.length
-                ));
+                if !many(why) {
+                    output::arguments(format_args!(
+                        "HOST FIRMWARE BUNDLE USE {} bytes={} for {why}\n",
+                        object.member, object.length
+                    ));
+                } else if let Some(summary) = summaries.iter_mut().find(|(seen, ..)| seen == why) {
+                    summary.1 += 1;
+                    summary.2 += object.length;
+                } else {
+                    summaries.push((why, 1, object.length));
+                }
                 bundled.selected.push(index);
                 bundled.regions.push(region);
             }
@@ -164,6 +185,11 @@ fn load_from(
                 ));
             }
         }
+    }
+    for (why, files, bytes) in summaries {
+        output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE USE {files} files bytes={bytes} for {why}\n"
+        ));
     }
     let read_bytes: usize = bundled.objects().iter().map(|object| object.length).sum();
     output::arguments(format_args!(

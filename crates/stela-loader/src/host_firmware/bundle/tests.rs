@@ -1,4 +1,9 @@
 use super::*;
+
+/// amdgpu's recipes whose bytes another holds, and the bundle's files and
+/// bytes with the AMD port: 648 files, 260.0 MiB.
+const AMD_SHARED: usize = 128;
+const AMD_TOTAL: (usize, usize) = (648, 272_649_034);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]
@@ -20,12 +25,12 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     let (count, bytes) = size();
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
-    // do, and, with the AMD port, amdgpu's `mec` and `mec2` of Raphael and
-    // of Navi 21.
+    // do, and, with the AMD port, amdgpu's files that hold another's bytes
+    // (`mec2` and `mec` of most families, a revision's files that did not
+    // change).
     if Ports::BUILT == Ports::ALL {
-        assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 121 files, 184.9 MiB.
-        assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+        assert_eq!(count + AMD_SHARED, recipes().count());
+        assert_eq!((count, bytes), AMD_TOTAL, "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
@@ -166,70 +171,96 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.sort_unstable();
     assert_eq!(members(&ax210), expected);
-    // With the AMD port: Ryzen 9000 graphics, the files amdgpu asks for on it, its HDMI audio
-    // function needs none, and an AMD display chip without pinned files
-    // (Navi 10) is named once.
+    // With the AMD port. Ryzen 9000 graphics, which amdgpu identifies by IP
+    // discovery: every file named after an IP version; its HDMI audio
+    // function needs none; a Navi 10 card, which amdgpu's table names: its
+    // family's files; and a Radeon HD 5000 card, which amdgpu leaves to
+    // radeon: none.
     let ryzen = select_for(
         &[
             pci(0x1002, 0x13c0, 0x03),
             pci(0x1002, 0x1640, 0x04),
             pci(0x1002, 0x731f, 0x03),
+            pci(0x1002, 0x6898, 0x03),
         ],
         Ports::ALL,
     );
-    // The files amdgpu asks for on a GPU of the PCI device ID `device`.
-    let family = |device: u16| {
-        let mut inventory = Inventory::default();
-        recipes::require_amdgpu(&mut inventory, device).unwrap();
-        let mut names: Vec<&str> = inventory
-            .requests()
-            .iter()
-            .map(|request| {
-                recipes::AMDGPU
-                    .iter()
-                    .find(|recipe| recipe.image.member == request.name)
-                    .unwrap()
-                    .image
-                    .member
-            })
-            .collect();
-        names.sort_unstable();
-        names
-    };
-    let raphael = family(0x13c0);
-    let mut expected: Vec<&str> = USB.to_vec();
-    expected.extend(raphael.iter().copied());
-    expected.sort_unstable();
-    // `mec2` is `mec`'s bytes, which the bundle holds once.
+    let amd: Vec<&Artifact> = recipes::AmdGpu::Discovered
+        .files()
+        .chain(recipes::AmdGpu::of(0x731f).files())
+        .map(|recipe| &recipe.image)
+        .collect();
     let found = members(&ryzen);
-    assert!(found.iter().all(|member| expected.contains(member)));
-    assert_eq!(found.len(), USB.len() + raphael.len() - 1);
-    assert_eq!(ryzen.unknown, ["pci 1002:731f"]);
-    // An RX 9070 (Navi 48) and its audio function: amdgpu's files for Navi
-    // 48 and nothing for the audio function.
-    let navi48 = select_for(
-        &[pci(0x1002, 0x7550, 0x03), pci(0x1002, 0xab40, 0x04)],
-        Ports::ALL,
-    );
-    let mut expected: Vec<&str> = USB.to_vec();
-    expected.extend(family(0x7550));
-    expected.sort_unstable();
-    assert_eq!(members(&navi48), expected);
-    assert!(navi48.unknown.is_empty());
-    // An RX 6800 XT (Navi 21): its files, `mec2` held once as `mec`'s bytes.
-    let navi21 = select_for(
-        &[pci(0x1002, 0x73bf, 0x03), pci(0x1002, 0xab28, 0x04)],
-        Ports::ALL,
-    );
-    let found = members(&navi21);
-    let files = family(0x73bf);
-    assert!(
-        found
-            .iter()
-            .all(|member| USB.contains(member) || files.contains(member))
-    );
-    assert_eq!(found.len(), USB.len() + files.len() - 1);
-    assert!(navi21.unknown.is_empty());
+    for member in ["amdgpu/gc_10_3_6_pfp.bin", "amdgpu/navi10_pfp.bin"] {
+        assert!(found.contains(&member), "{member}");
+    }
+    assert!(found.iter().all(
+        |member| USB.contains(member) || amd.iter().any(|artifact| artifact.member == *member)
+    ));
+    // Files of the same bytes are read once.
+    let mut digests: Vec<&str> = amd.iter().map(|artifact| artifact.sha256).collect();
+    digests.sort_unstable();
+    digests.dedup();
+    assert_eq!(found.len(), USB.len() + digests.len());
+    assert!(ryzen.unknown.is_empty());
+    // The files amdgpu loaded on an RX 9070 XT (Navi 48) and an RX 6800 XT
+    // (Navi 21) under Stela, display core included, are among theirs.
+    for (device, loaded) in [
+        (
+            0x7550,
+            &[
+                "gc_12_0_1_imu",
+                "gc_12_0_1_me",
+                "gc_12_0_1_mec",
+                "gc_12_0_1_pfp",
+                "gc_12_0_1_rlc",
+                "gc_12_0_1_uni_mes",
+                "psp_14_0_3_sos",
+                "psp_14_0_3_ta",
+                "sdma_7_0_1",
+                "smu_14_0_3",
+                "vcn_5_0_0",
+                "dcn_4_0_1_dmcub",
+            ],
+        ),
+        (
+            0x73bf,
+            &[
+                "sienna_cichlid_ce",
+                "sienna_cichlid_me",
+                "sienna_cichlid_mec",
+                "sienna_cichlid_mec2",
+                "sienna_cichlid_pfp",
+                "sienna_cichlid_rlc",
+                "sienna_cichlid_sdma",
+                "sienna_cichlid_smc",
+                "sienna_cichlid_sos",
+                "sienna_cichlid_ta",
+                "sienna_cichlid_vcn",
+                "sienna_cichlid_dmcub",
+            ],
+        ),
+    ] {
+        let card = select_for(&[pci(0x1002, device, 0x03)], Ports::ALL);
+        let found = members(&card);
+        for file in loaded {
+            let member = format!("amdgpu/{file}.bin");
+            let held = recipes::AMDGPU
+                .iter()
+                .find(|recipe| recipe.image.member == member)
+                .unwrap_or_else(|| panic!("{member}"));
+            // `mec2` may be read as `mec`'s bytes.
+            assert!(
+                found
+                    .iter()
+                    .any(|name| recipes::AMDGPU.iter().any(|recipe| {
+                        recipe.image.member == *name && recipe.image.sha256 == held.image.sha256
+                    })),
+                "{device:04x} {member}"
+            );
+        }
+        assert!(card.unknown.is_empty());
+    }
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);

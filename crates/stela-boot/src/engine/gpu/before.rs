@@ -117,10 +117,11 @@ static NOUVEAU: Before = Before {
     },
 };
 
-/// amdgpu: the files are those its IP blocks ask for on the PCI device ID's
-/// GPU, as pinned. The driver reads which blocks the device has from the
-/// device's own discovery table and loads every engine's firmware itself,
-/// so nothing boots by itself after the reset and nothing waits here.
+/// amdgpu: the files are those it may ask for on the PCI device ID's GPU,
+/// as pinned: its family's for a device its table names, every file named
+/// after an IP version for one it identifies by the device's own IP
+/// discovery table. The driver loads every engine's firmware itself, so
+/// nothing boots by itself after the reset and nothing waits here.
 static AMDGPU: Before = Before {
     admits: |adapter, catalog| {
         on_usb(
@@ -302,14 +303,11 @@ fn video_bios_table(
     image
 }
 
-/// The files amdgpu asks for on the AMD GPU with PCI device ID `device`.
+/// The files amdgpu may ask for on the AMD GPU with PCI device ID `device`.
 fn amdgpu_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_amdgpu(&mut inventory, device).map_err(|_| {
-        ServiceError::Refused(
-            "Stela pins amdgpu's firmware only for Ryzen 7000 and 9000 desktop graphics, \
-                 not for this GPU",
-        )
+        ServiceError::Refused("amdgpu leaves this GPU to an older driver and loads no files for it")
     })?;
     Ok(inventory)
 }
@@ -414,15 +412,20 @@ fn select_firmware(
     let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
     let mut bindings = Vec::new();
     let mut missing = Vec::new();
+    // A driver that chooses among many files by what the device reports
+    // (amdgpu by IP discovery) gets one line for them, not one each.
+    let summarized = plan.selections().len() > SUMMARIZED;
     for selection in plan.selections() {
         let request = &selection.request;
         let found = find(stored, selection);
         if let Ok(image) = found {
-            output::arguments(format_args!(
-                "GPU {name}: firmware {} of {} bytes\n",
-                request.name,
-                image.bytes().len()
-            ));
+            if !summarized {
+                output::arguments(format_args!(
+                    "GPU {name}: firmware {} of {} bytes\n",
+                    request.name,
+                    image.bytes().len()
+                ));
+            }
             bindings.push((image, request));
         }
         match found {
@@ -461,6 +464,17 @@ fn select_firmware(
     if !missing.is_empty() {
         lacks(name, &missing, names.len());
         return Err(ServiceError::Refused(NO_FIRMWARE));
+    }
+    if summarized {
+        output::arguments(format_args!(
+            "GPU {name}: {} firmware files of {} bytes, of which its driver loads those the \
+             device names\n",
+            bindings.len(),
+            bindings
+                .iter()
+                .map(|(image, _)| image.bytes().len())
+                .sum::<usize>()
+        ));
     }
     names.extend(read.iter().map(|(_, name)| String::from(*name)));
     // Each file under the exact name and target the driver asks for.
@@ -592,6 +606,9 @@ fn wait_for_firmware_boot(
         }
     }
 }
+
+/// More firmware files than this for one GPU are logged as one line.
+const SUMMARIZED: usize = 16;
 
 /// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 pub(super) const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";

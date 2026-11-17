@@ -150,7 +150,7 @@ impl Inventory {
 
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(fail("host firmware requirement inventory exceeds 128 KiB"));
+            return Err(fail("host firmware requirement inventory exceeds 1 MiB"));
         }
         let inventory: Self = serde_json::from_slice(bytes)
             .map_err(|e| Error(alloc::format!("host firmware requirements: {e}")))?;
