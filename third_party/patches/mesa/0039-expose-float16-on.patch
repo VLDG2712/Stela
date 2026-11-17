@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:52:36 +0000
+Subject: [PATCH] radv: expose float16 on GFX8 by default, where the hardware
+ runs it at single rate
+
+---
+ src/amd/vulkan/radv_drirc_gen.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_drirc_gen.py b/src/amd/vulkan/radv_drirc_gen.py
+index 111b93caa3ad11ad02b86858267dbec6f4a041ef..d83f64d3b5903f3198113068eda519ccab9d1fdd 100644
+--- a/src/amd/vulkan/radv_drirc_gen.py
++++ b/src/amd/vulkan/radv_drirc_gen.py
+@@ -126,8 +126,8 @@ def declare_options():
+         B("radv_emulate_rt", False,
+           "Expose RT extensions on GFX10 and below through software emulation.",
+           c_name="emulate_rt"),
+-        B("radv_enable_float16_gfx8", False,
+-          "Expose float16 on GFX8, where it's supported but usually not beneficial.",
++        B("radv_enable_float16_gfx8", True,
++          "Expose float16 on GFX8, where it's supported without double rate packed math.",
+           c_name="enable_float16_gfx8"),
+     ]
+ 
