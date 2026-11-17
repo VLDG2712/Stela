@@ -6,10 +6,11 @@
  * Copyright (c) 2006 Novell, Inc.
  */
 /* Linux's device model, following Linux
- * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c and class.c,
- * and lib/devres.c. Stela's owners create and attach devices, and
- * nothing reads sysfs: adding a device only keeps its parent alive, a class
- * is its name and no attribute file exists. */
+ * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 drivers/base/core.c, bus.c and
+ * class.c, and lib/devres.c. Stela's owners create and attach devices, and
+ * nothing reads sysfs: adding a device keeps its parent alive and lists it
+ * for the driver core's searches, a class is its name and no attribute file
+ * exists. */
 #include <linux/component.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -77,6 +78,137 @@ void put_device(struct device *dev)
 		kobject_put(&dev->kobj);
 }
 
+/* The driver core's lists, which drivers/base keeps in each device's
+ * private part (its parent's children, its bus's and its class's devices):
+ * here one list of every added device in the order added, which the
+ * searches filter by parent, bus or class. A search takes references to
+ * what it visits under the lock and calls its function outside it, so the
+ * function may add and delete devices, as Linux's klist walks allow. */
+struct listed {
+	struct list_head node;
+	struct device *dev;
+};
+static LIST_HEAD(listed);
+static DEFINE_SPINLOCK(listed_lock);
+
+static int list_device(struct device *dev)
+{
+	struct listed *entry = kmalloc_obj(*entry);
+
+	if (!entry)
+		return -ENOMEM;
+	entry->dev = dev;
+	guard(spinlock)(&listed_lock);
+	list_add_tail(&entry->node, &listed);
+	return 0;
+}
+
+static void unlist_device(struct device *dev)
+{
+	struct listed *entry;
+
+	guard(spinlock)(&listed_lock);
+	list_for_each_entry(entry, &listed, node) {
+		if (entry->dev == dev) {
+			list_del(&entry->node);
+			kfree(entry);
+			return;
+		}
+	}
+}
+
+/* Which listed devices a search visits. */
+struct selection {
+	const struct device *parent;
+	const struct bus_type *bus;
+	const struct class *class;
+};
+
+static bool selected(const struct device *dev, const struct selection *selection)
+{
+	return (!selection->parent || dev->parent == selection->parent) &&
+	       (!selection->bus || dev->bus == selection->bus) &&
+	       (!selection->class || dev->class == selection->class);
+}
+
+static size_t count_selected(const struct selection *selection)
+{
+	struct listed *entry;
+	size_t found = 0;
+
+	guard(spinlock)(&listed_lock);
+	list_for_each_entry(entry, &listed, node)
+		found += selected(entry->dev, selection);
+	return found;
+}
+
+/* A referenced copy of the selected devices after `start` (or all), in
+ * the order added; NULL with *count 0 when there are none or no memory.
+ * The copy is allocated outside the lock, and taken again if devices were
+ * added meanwhile. */
+static struct device **select_devices(const struct selection *selection,
+				      const struct device *start, size_t *count)
+{
+	*count = 0;
+	for (size_t room = count_selected(selection); room;) {
+		struct device **devices = kmalloc_array(room, sizeof(*devices), GFP_KERNEL);
+		struct listed *entry;
+		size_t taken = 0, found = 0;
+		bool started = !start;
+
+		if (!devices)
+			return NULL;
+		scoped_guard(spinlock, &listed_lock) {
+			list_for_each_entry(entry, &listed, node)
+				found += selected(entry->dev, selection);
+			if (found <= room)
+				list_for_each_entry(entry, &listed, node) {
+					if (!selected(entry->dev, selection))
+						continue;
+					if (!started) {
+						started = entry->dev == start;
+						continue;
+					}
+					devices[taken++] = get_device(entry->dev);
+				}
+		}
+		if (found <= room) {
+			*count = taken;
+			return devices;
+		}
+		kfree(devices);
+		room = found;
+	}
+	return NULL;
+}
+
+static void put_devices(struct device **devices, size_t from, size_t count)
+{
+	for (size_t i = from; i < count; i++)
+		put_device(devices[i]);
+	kfree(devices);
+}
+
+/* The first selected device after `start` that `match` accepts, referenced. */
+static struct device *find_device(const struct selection *selection, const struct device *start,
+				  const void *data, device_match_t match)
+{
+	size_t count;
+	struct device **devices = select_devices(selection, start, &count);
+
+	for (size_t i = 0; i < count; i++) {
+		struct device *dev = devices[i];
+
+		if (match(dev, data)) {
+			put_devices(devices, i + 1, count);
+			return dev;
+		}
+		put_device(dev);
+	}
+	kfree(devices);
+	return NULL;
+}
+
 int device_add(struct device *dev)
 {
 	if (dev->init_name) {
@@ -91,7 +223,12 @@ int device_add(struct device *dev)
 	struct device *parent = dev->parent;
 	get_device(dev);
 	get_device(parent);
-	int error = stela_linux_device_inherit(dev);
+	int error = list_device(dev);
+	if (!error) {
+		error = stela_linux_device_inherit(dev);
+		if (error)
+			unlist_device(dev);
+	}
 	if (error) {
 		put_device(dev);
 		put_device(parent);
@@ -103,6 +240,7 @@ int device_add(struct device *dev)
 void device_del(struct device *dev)
 {
 	struct device *parent = dev->parent;
+	unlist_device(dev);
 	stela_linux_device_close(dev);
 
 	stela_linux_devres_release(dev);
@@ -194,14 +332,10 @@ int device_match_of_node(struct device *dev, const void *np)
 }
 
 /* A bus is its type: Stela's owners match and bind the devices of the buses
- * they own, so registering one records nothing. A Linux driver on a bus, a
- * search of a bus's devices and a walk of a device's children need the
- * driver core's lists, which do not exist. Each is said once and answers as
- * Linux does when it finds nothing to act on: a driver is refused (only MIPI
- * DSI and DP AUX bus drivers register one, and the image holds none), a
- * search finds no device, and a walk visits no child, so the children of a
- * MIPI DSI host that goes away (a DSI panel's encoder torn down) stay
- * registered and keep their host's device, as their references hold it. */
+ * they own, so registering one records nothing. A Linux driver on a bus is
+ * refused, said once, as only MIPI DSI and DP AUX bus drivers register one
+ * and the image holds none. Searches of a bus's devices and walks of a
+ * device's children go over the listed devices. */
 int bus_register(const struct bus_type *bus)
 {
 	return bus && bus->name ? 0 : -EINVAL;
@@ -228,30 +362,47 @@ void driver_unregister(struct device_driver *driver)
 struct device *bus_find_device(const struct bus_type *bus, struct device *start,
 			       const void *data, device_match_t match)
 {
-	(void)bus;
-	(void)start;
-	(void)data;
-	(void)match;
-	stela_linux_unsupported("a search of a bus's devices: it finds none");
-	return NULL;
+	const struct selection selection = {.bus = bus};
+
+	return bus ? find_device(&selection, start, data, match) : NULL;
 }
 
+struct device *device_find_child(struct device *parent, const void *data, device_match_t match)
+{
+	const struct selection selection = {.parent = parent};
+
+	return parent ? find_device(&selection, NULL, data, match) : NULL;
+}
+
+/* Each child in the order added until `fn` answers other than 0, which is
+ * the answer. A child that cannot be visited for want of memory ends the
+ * walk with -ENOMEM. */
 int device_for_each_child(struct device *parent, void *data, device_iter_t fn)
 {
-	(void)parent;
-	(void)data;
-	(void)fn;
-	stela_linux_unsupported("a walk of a device's children: they stay registered");
-	return 0;
+	const struct selection selection = {.parent = parent};
+	size_t count;
+	struct device **devices;
+	int result = 0;
+
+	if (!parent)
+		return -EINVAL;
+	devices = select_devices(&selection, NULL, &count);
+	if (!devices)
+		return count_selected(&selection) ? -ENOMEM : 0;
+	for (size_t i = 0; i < count; i++) {
+		if (!result)
+			result = fn(devices[i], data);
+		put_device(devices[i]);
+	}
+	kfree(devices);
+	return result;
 }
 
 /* A class is its name: a device of one is created and attached like any
  * other, and its attribute groups are files nothing reads. Registering a
- * class therefore records nothing, as registering a bus does. A search of a
- * class's devices and of a device's children need the driver core's lists,
- * which do not exist; only a panel driver looks a backlight up by name or
- * node and only an I2C sensor with packet error checking looks for its
- * hwmon child, and the image holds neither. */
+ * class therefore records nothing, as registering a bus does; a search of
+ * a class's devices goes over the listed devices (the display code asks
+ * whether a backlight device of its name exists before it registers one). */
 int class_register(const struct class *class)
 {
 	return class && class->name ? 0 : -EINVAL;
@@ -262,10 +413,13 @@ void class_unregister(const struct class *class)
 	(void)class;
 }
 
-STELA_UNSUPPORTED(struct device *, class_find_device, const struct class *, const struct device *,
-		  const void *, device_match_t)
-STELA_UNSUPPORTED(struct device *, device_find_child, struct device *, const void *,
-		  device_match_t)
+struct device *class_find_device(const struct class *class, const struct device *start,
+				 const void *data, device_match_t match)
+{
+	const struct selection selection = {.class = class};
+
+	return class ? find_device(&selection, start, data, match) : NULL;
+}
 
 struct class *class_create(const char *name)
 {
@@ -457,6 +611,64 @@ static void test_properties(void)
 	assert(values[0] == 7 && values[1] == 13);
 }
 
+static int count_child(struct device *dev, void *data)
+{
+	(void)dev;
+	return ++*(int *)data == 2 ? 7 : 0;
+}
+
+static int remove_child(struct device *dev, void *data)
+{
+	(void)data;
+	device_unregister(dev);
+	return 0;
+}
+
+/* The searches find what was added and not deleted, by class, bus or
+ * parent, in the order added, each found device referenced. */
+static void test_lists(const struct bus_type *bus, const struct class *class)
+{
+	released = 0;
+	struct device parent = {.release = release};
+	struct device first = {.parent = &parent, .class = class, .release = release};
+	struct device second = {.parent = &parent, .bus = bus, .release = release};
+	struct device third = {.parent = &parent, .class = class, .release = release};
+	device_initialize(&parent);
+	assert(!dev_set_name(&parent, "parent") && !device_add(&parent));
+	device_initialize(&first);
+	device_initialize(&second);
+	device_initialize(&third);
+	assert(!dev_set_name(&first, "intel_backlight") && !device_add(&first));
+	assert(!dev_set_name(&second, "second") && !device_add(&second));
+	assert(!dev_set_name(&third, "third") && !device_add(&third));
+
+	unsigned int references = kref_read(&first.kobj.kref);
+	assert(class_find_device_by_name(class, "intel_backlight") == &first);
+	assert(kref_read(&first.kobj.kref) == references + 1);
+	put_device(&first);
+	assert(!class_find_device_by_name(class, "second"));
+	assert(class_find_device(class, &first, "third", device_match_name) == &third);
+	put_device(&third);
+	assert(!class_find_device(class, &third, "intel_backlight", device_match_name));
+	assert(bus_find_device_by_name(bus, NULL, "second") == &second);
+	put_device(&second);
+	assert(device_find_child(&parent, "third", device_match_name) == &third);
+	put_device(&third);
+	assert(!device_find_child(&first, "third", device_match_name));
+
+	int visited = 0;
+	assert(device_for_each_child(&parent, &visited, count_child) == 7 && visited == 2);
+	visited = 0;
+	assert(!device_for_each_child(&first, &visited, count_child) && !visited);
+	/* A walk may delete what it visits. */
+	assert(!device_for_each_child(&parent, NULL, remove_child));
+	assert(!device_find_child(&parent, "second", device_match_name));
+	assert(!class_find_device_by_name(class, "intel_backlight"));
+	assert(released == 3);
+	device_unregister(&parent);
+	assert(released == 4);
+}
+
 static const struct stela_linux_services services = {
 	.map_device = map_device,
 	.unmap_device = unmap_device,
@@ -543,6 +755,7 @@ int main(void)
 	struct class *class = class_create("test");
 	assert(!IS_ERR(class) && !strcmp(class->name, "test"));
 	class_destroy(class);
+	test_lists(&test_bus, &test_class);
 	stela_linux_exit();
 	printf("Linux device references: the last put releases the device passed\n");
 	return 0;
