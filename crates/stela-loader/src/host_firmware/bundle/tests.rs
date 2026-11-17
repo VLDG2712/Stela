@@ -439,19 +439,28 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let boot = include_str!("../../../../stela-boot/Cargo.toml");
     let loader = include_str!("../../../Cargo.toml");
     let cli = include_str!("../../../../stela-cli/Cargo.toml");
-    // The default image's drivers, the boot's bundle and a default stick's:
-    // no AMD port in any.
+    let release = include_str!("../../../../../.github/workflows/release.yml");
+    // The boot's drivers and bundle without features: no AMD port in any.
     let drivers = ports_of(line(boot, "stela-drivers = "));
     assert_eq!(drivers, Ports::NONE);
     assert_eq!(ports_of(line(boot, "stela-loader = ")), drivers);
     assert_eq!(ports_of(line(loader, "default = ")), drivers);
-    // An image with amdgpu reads its firmware, and `stela` built with the
-    // port writes it.
+    // An image with amdgpu reads its firmware, and `stela`, which carries
+    // that image outside a release, writes it.
     let amdgpu = line(boot, "amdgpu = ");
     assert!(amdgpu.contains("\"stela-drivers/amdgpu-port\""), "{amdgpu}");
     assert!(amdgpu.contains("\"stela-loader/amdgpu-port\""), "{amdgpu}");
     let port = line(cli, "amdgpu-port = ");
     assert!(port.contains("\"stela-loader/amdgpu-port\""), "{port}");
+    assert!(line(cli, "default = ").contains("\"amdgpu-port\""));
+    // A release builds its image without the port (`STELA_RELEASE`, which
+    // `xtask boot build` reads) and `stela` without its default features.
+    assert!(release.contains("STELA_RELEASE: \"1\""));
+    let built = release
+        .lines()
+        .find(|line| line.contains("cargo build") && line.contains("-p stela-cli"))
+        .expect("the release builds stela");
+    assert!(built.contains("--no-default-features"), "{built}");
 }
 
 #[test]

@@ -16,9 +16,11 @@ name = "stela"
 path = "src/main.rs"
 
 [features]
-# The AMD GPU port's firmware on the sticks `stela` makes, for a boot image
-# built with amdgpu (`cargo xtask boot build --amdgpu` or `--radv`); a
-# release leaves both out.
+# The AMD GPU port's firmware on the sticks `stela` makes, as the boot image
+# `cargo xtask boot build` makes holds amdgpu outside a release. The release
+# workflow builds `stela` without default features and its image without the
+# port (`.github/workflows/release.yml`).
+default = ["amdgpu-port"]
 amdgpu-port = ["stela-loader/amdgpu-port"]
 
 [dependencies]

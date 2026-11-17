@@ -307,8 +307,10 @@ jobs:
       - name: Build stela
         run: |
           export STELA_EFI="$PWD/efi/stela.efi"
+          # As the release image, without the AMD port: no AMD firmware on
+          # the sticks it makes.
           for target in ${{ matrix.targets }}; do
-            cargo build --release --locked -p stela-cli --target "$target"
+            cargo build --release --locked -p stela-cli --no-default-features --target "$target"
           done
           mkdir -p "$ARCHIVE"
           case "$RUNNER_OS" in
