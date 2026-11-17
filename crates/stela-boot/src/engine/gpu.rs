@@ -2164,6 +2164,20 @@ impl Installed {
 
 static INSTALLED: AtomicPtr<Installed> = AtomicPtr::new(ptr::null_mut());
 
+/// Whether a bound GPU's kernel driver watches for its own resets
+/// ([`GpuStack`]'s `kernel.reset`, amdgpu's): a reset it makes holds back
+/// every later close of its files, so a step that waits on one may never
+/// return.
+#[cfg(feature = "nvk")]
+pub(super) fn bound_gpu_may_hang() -> bool {
+    installed().is_some_and(|gpu| {
+        gpu.start
+            .bound
+            .iter()
+            .any(|bound| bound.stack.kernel.reset.is_some())
+    })
+}
+
 fn installed() -> Option<&'static Installed> {
     // SAFETY: a published environment is leaked, so it lives for the boot.
     unsafe { INSTALLED.load(Ordering::Acquire).as_ref() }

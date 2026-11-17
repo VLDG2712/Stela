@@ -861,15 +861,17 @@ fn describe_host(
 }
 
 /// A part of "Setting up the Mac's hardware" begins: named on the log and,
-/// in an image with amdgpu, whose parts may wait on a GPU it is still
-/// bringing up, stored on the USB first. The step stores the log only at its
-/// end, so a part that never returns showed no line of its own: this one
-/// names it. Other images keep the step's single store, whose wait each
-/// part's store would add to every boot.
+/// where a bound GPU's driver may hang the parts that wait on it
+/// ([`gpu::bound_gpu_may_hang`]), stored on the USB first. The step stores
+/// the log only at its end, so a part that never returns showed no line of
+/// its own: this one names it. Other boots keep the step's single store,
+/// whose wait each part's store would add.
 fn hardware_step(name: &str) {
     output::arguments(format_args!("HARDWARE {name}\n"));
-    #[cfg(feature = "amdgpu")]
-    output::flush_log();
+    #[cfg(feature = "nvk")]
+    if gpu::bound_gpu_may_hang() {
+        output::flush_log();
+    }
 }
 
 fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
