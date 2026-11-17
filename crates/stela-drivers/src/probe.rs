@@ -34,6 +34,8 @@ mod companion;
 #[cfg(feature = "native-acpi")]
 pub mod d3cold;
 #[cfg(feature = "native-acpi")]
+pub mod gpu_methods;
+#[cfg(feature = "native-acpi")]
 mod i2c;
 #[cfg(feature = "native-acpi")]
 mod power;

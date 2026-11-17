@@ -2057,6 +2057,35 @@ pub(super) fn panel_brightness(
     }
 }
 
+/// Where an AMD GPU was claimed, name once each of AMD's graphics ACPI
+/// methods the namespace holds, which amdgpu calls only where Linux builds
+/// its ACPI support and Stela's profile does not, and what it does without
+/// it (`stela_drivers::probe::gpu_methods`).
+pub(super) fn amd_acpi_methods(acpi: Option<&'static super::aml::HostAcpi>, claimed: &[Claimed]) {
+    use stela_drivers::probe::gpu_methods::{self, METHODS};
+    if !claimed
+        .iter()
+        .any(|gpu| gpu.stack.vendor == stela_drivers::gpu::Vendor::Amd)
+    {
+        return;
+    }
+    let Some(acpi) = acpi else { return };
+    let then = "amdgpu runs without AMD's graphics ACPI methods";
+    let Some(Ok(found)) = acpi.firmware("AMD graphics methods", then, false, gpu_methods::find)
+    else {
+        return;
+    };
+    for (method, path) in found {
+        let response = METHODS
+            .iter()
+            .find(|(name, _)| *name == method)
+            .map_or("", |(_, response)| response);
+        output::arguments(format_args!(
+            "UNSUPPORTED GPU ACPI {method} at {path}: amdgpu is built without ACPI; {response}\n"
+        ));
+    }
+}
+
 /// Bring Linux up over `claimed`, and return once nouveau has bound them or
 /// failed, as the guest should not start with a half-started GPU beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
