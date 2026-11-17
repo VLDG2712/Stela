@@ -139,6 +139,7 @@ fn vfio_gpu_takes_a_discrete_cards_whole_slot_bound_to_vfio_pci() {
         fs::create_dir_all(&directory).unwrap();
         std::os::unix::fs::symlink(format!("/drivers/{driver}"), directory.join("driver")).unwrap();
         fs::write(directory.join("vendor"), format!("{vendor}\n")).unwrap();
+        fs::write(directory.join("device"), "0x0000\n").unwrap();
         fs::write(directory.join("class"), format!("{class}\n")).unwrap();
     };
     // A discrete card: display and HD audio, both the card vendor's.
@@ -184,6 +185,7 @@ fn an_integrated_gpu_lends_only_its_display_and_hd_audio() {
     let function = |name: &str, vendor: u16, class: u32| vfio::Function {
         name: name.into(),
         vendor,
+        device: 0,
         class,
     };
     // An APU's slot: its GPU and HD audio, then the platform's security
@@ -497,4 +499,40 @@ fn storage_mdts_is_optional_typed_and_requires_a_disk() {
     ] {
         assert!(crate::Cli::try_parse_from(base.into_iter().chain(extra)).is_err());
     }
+}
+
+#[test]
+fn the_host_vfct_goes_to_the_run_only_when_it_holds_a_lent_gpus_video_bios() {
+    // The fixed part, then a zero-length image, then 1002:13c0's.
+    let image = |vendor: u16, device: u16, length: u32| {
+        let mut header = vec![0u8; 0x1c];
+        header[0xc..0xe].copy_from_slice(&vendor.to_le_bytes());
+        header[0xe..0x10].copy_from_slice(&device.to_le_bytes());
+        header[0x18..0x1c].copy_from_slice(&length.to_le_bytes());
+        header.extend(std::iter::repeat_n(0x55, length as usize));
+        header
+    };
+    let mut table = vec![0u8; 0x4c];
+    table[..4].copy_from_slice(b"VFCT");
+    table[0x34..0x38].copy_from_slice(&0x4cu32.to_le_bytes());
+    table.extend(image(0x10de, 0x2c02, 0));
+    table.extend(image(0x1002, 0x13c0, 0x200));
+    let length = table.len() as u32;
+    table[4..8].copy_from_slice(&length.to_le_bytes());
+    assert!(vfio::vfct_holds(&table, 0x1002, 0x13c0));
+    // A zero-length image is no image; other GPUs have none.
+    assert!(!vfio::vfct_holds(&table, 0x10de, 0x2c02));
+    assert!(!vfio::vfct_holds(&table, 0x1002, 0x1640));
+    // An image past the table's own length, or a table cut short, is not read.
+    let mut short = table.clone();
+    short[4..8].copy_from_slice(&(length - 0x200).to_le_bytes());
+    assert!(!vfio::vfct_holds(&short, 0x1002, 0x13c0));
+    assert!(!vfio::vfct_holds(&table[..0x40], 0x1002, 0x13c0));
+    let mut other = table.clone();
+    other[..4].copy_from_slice(b"FACP");
+    assert!(!vfio::vfct_holds(&other, 0x1002, 0x13c0));
+    assert_eq!(
+        vfio::acpi_table_argument(Path::new("/run/a,b/VFCT")),
+        "file=/run/a,,b/VFCT"
+    );
 }

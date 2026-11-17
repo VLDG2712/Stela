@@ -263,9 +263,13 @@ pub struct Run {
     /// Hand the mount a physical GPU through VFIO: this PCI function of the
     /// host (such as `0000:01:00.0`) and the functions of its slot that
     /// belong to its GPU (a discrete card's whole slot, an integrated GPU's
-    /// display and HD audio), in a slot of their own behind a PCIe root port. The emulated VGA stays as
-    /// the firmware's display, for a card with no monitor; one with a monitor
-    /// takes the display. `xtask/scripts/vfio-gpu.sh` binds it for a run.
+    /// display and HD audio), in a slot of their own behind a PCIe root
+    /// port. The emulated VGA stays as the firmware's display, for a card
+    /// with no monitor; one with a monitor takes the display.
+    /// `xtask/scripts/vfio-gpu.sh` binds it for a run.
+    /// The host's ACPI VFCT table, which holds an integrated AMD GPU's video
+    /// BIOS, joins the run's ACPI tables when it holds a lent function's;
+    /// `STELA_HOST_VFCT` names a readable copy, which vfio-gpu.sh makes.
     #[arg(long, requires = "kvm", conflicts_with = "iommu", value_parser = parse_pci_function)]
     vfio_gpu: Option<String>,
     /// Boot an existing USB disk image, such as a copy of a stick `stela

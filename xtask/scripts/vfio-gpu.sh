@@ -169,6 +169,7 @@ restore() {
   for console in /sys/class/vtconsole/vtcon*; do
     echo 1 >"$console/bind" 2>/dev/null
   done
+  [[ -n $vfct ]] && rm -f "$vfct"
   ((stopped)) && systemctl start display-manager.service
   set -e
 }
@@ -193,6 +194,7 @@ run() {
   card=$(gpu)
   mapfile -t members < <(functions "$card")
   kept=()
+  vfct=
   stopped=0
   nvidia=0
   trap restore EXIT
@@ -210,6 +212,15 @@ run() {
   for function in "${members[@]}"; do bind "$function"; done
   local group
   for group in $(groups "${members[@]}"); do chown "$owner" "/dev/vfio/$group"; done
+  # The host's ACPI VFCT table, where firmware publishes an integrated AMD
+  # GPU's video BIOS, is root's in sysfs: the command gets a copy it may
+  # read, which `cargo xtask boot run` gives the run's firmware.
+  if [[ -r /sys/firmware/acpi/tables/VFCT ]]; then
+    vfct=$(mktemp --tmpdir stela-vfct.XXXXXX)
+    cat /sys/firmware/acpi/tables/VFCT >"$vfct"
+    chown "$owner" "$vfct"
+    export STELA_HOST_VFCT=$vfct
+  fi
   ulimit -l unlimited
   local code=0
   # Stopping the service ends the command too: first let the card write no
