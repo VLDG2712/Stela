@@ -1254,7 +1254,10 @@ builtin_value(struct translator *t, enum stela_air_builtin builtin)
          return nir_channel(b, t->patch_ids, 1);
       return nir_iadd(b, nir_load_instance_id(b), nir_load_base_instance(b));
    case STELA_AIR_BASE_VERTEX:
-      return nir_load_base_vertex(b);
+      /* Vulkan's BaseVertex: the vertex offset of an indexed draw, the
+       * first vertex of another. NIR's base_vertex is OpenGL's, which
+       * Vulkan drivers need not implement (ACO does not). */
+      return nir_load_first_vertex(b);
    case STELA_AIR_BASE_INSTANCE:
       return t->patch_ids ? nir_channel(b, t->patch_ids, 2) : nir_load_base_instance(b);
    case STELA_AIR_PATCH_ID:

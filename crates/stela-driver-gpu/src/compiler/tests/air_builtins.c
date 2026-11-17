@@ -259,7 +259,7 @@ vertex_builtins_include_the_bases(void)
    struct census census = count(shader);
    assert(census.intrinsics[nir_intrinsic_load_vertex_id] == 1);
    assert(census.intrinsics[nir_intrinsic_load_instance_id] == 1);
-   assert(census.intrinsics[nir_intrinsic_load_base_vertex] == 1);
+   assert(census.intrinsics[nir_intrinsic_load_first_vertex] == 1);
    /* instance_id adds it, and base_instance reads it. */
    assert(census.intrinsics[nir_intrinsic_load_base_instance] == 2);
    assert(census.amplification_loads == 1 && census.count_loads == 1);
