@@ -13,6 +13,12 @@
 #endif
 
 static const nir_shader_compiler_options nir_options = {.max_unroll_iterations = 32};
+/* A driver's that reads fragment coordinates as separate parts, as RADV's. */
+static const nir_shader_compiler_options separate_options = {
+   .max_unroll_iterations = 32,
+   .frag_coord_form = nir_frag_coord_xy_z_w_separate,
+};
+static const nir_shader_compiler_options *shader_options = &nir_options;
 
 static const char *module =
    "target datalayout = \"e-p:64:64-i32:32-i64:64-f32:32-v128:128-n8:16:32\"\n"
@@ -137,11 +143,11 @@ translate(const char *body, const char *entry_metadata, const char *entry, int s
          .resources = options(stage == STELA_AIR_FRAGMENT ? &fragment : &primary, false, device),
       };
       shader = stela_air_stage_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input), entry,
-                                      &nir_options, &o, error);
+                                      shader_options, &o, error);
    } else {
       const struct stela_air_options o = options(&primary, true, device);
       shader = stela_air_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input), entry,
-                                &nir_options, &o, error);
+                                shader_options, &o, error);
    }
    LLVMDisposeMemoryBuffer(input);
    if (!shader)
@@ -285,6 +291,35 @@ fragment_builtins_read_the_rasterizer(void)
    ralloc_free(shader);
 }
 
+/* The fragment position takes the form of fragment coordinates the
+ * driver's compiler reads: RADV's reads x and y, z and w apart and has no
+ * whole coordinate. */
+static void
+fragment_positions_take_the_drivers_form(void)
+{
+   const char *body = "define <4 x float> @fragment(<4 x float> %position) {\n"
+                      "ret <4 x float> %position\n}\n";
+   const char *md = "!air.fragment = !{!2}\n!2 = !{ptr @fragment, !3, !4}\n"
+                    "!3 = !{!5}\n!5 = !{!\"air.render_target\", i32 0, i32 0,"
+                    " !\"air.arg_type_name\", !\"float4\"}\n!4 = !{!40}\n"
+                    "!40 = !{i32 0, !\"air.position\", !\"air.center\", !\"air.no_perspective\","
+                    " !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}\n";
+   for (unsigned separate = 0; separate < 2; separate++) {
+      shader_options = separate ? &separate_options : &nir_options;
+      struct stela_air_error error = {0};
+      nir_shader *shader = translate(body, md, "fragment", STELA_AIR_FRAGMENT, false, &error);
+      assert(shader && error.kind == STELA_AIR_OK);
+      struct census census = count(shader);
+      bool whole = census.intrinsics[nir_intrinsic_load_frag_coord] != 0;
+      assert(whole != (bool)separate);
+      assert((census.intrinsics[nir_intrinsic_load_frag_coord_xy] != 0) == (bool)separate);
+      assert((census.intrinsics[nir_intrinsic_load_frag_coord_z] != 0) == (bool)separate);
+      assert((census.intrinsics[nir_intrinsic_load_frag_coord_w] != 0) == (bool)separate);
+      ralloc_free(shader);
+   }
+   shader_options = &nir_options;
+}
+
 static void
 refuses_misplaced_and_malformed_builtins(void)
 {
@@ -368,6 +403,7 @@ main(void)
    kernels_without_device_values_run_whole_threadgroups();
    vertex_builtins_include_the_bases();
    fragment_builtins_read_the_rasterizer();
+   fragment_positions_take_the_drivers_form();
    refuses_misplaced_and_malformed_builtins();
    kernels_bound_their_workgroups();
    glsl_type_singleton_decref();
