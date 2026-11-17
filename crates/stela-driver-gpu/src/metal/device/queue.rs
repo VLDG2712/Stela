@@ -35,8 +35,8 @@ use super::{
 };
 use crate::metal::{
     abi::{
-        LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, StoreAction,
-        StoreActionOptions, VisibilityResultType,
+        LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+        PrimitiveTopologyClass, StoreAction, StoreActionOptions, VisibilityResultType,
     },
     binding::ResourceId,
     command_buffer::{
@@ -2686,8 +2686,9 @@ impl<B: Backend, C: Compiler> Resolver for DeviceResolver<'_, B, C> {
         &mut self,
         state: &RenderPipelineState,
         bicubic: [u32; 2],
+        class: PrimitiveTopologyClass,
     ) -> Result<Pipeline> {
-        self.device.render_variant(state.id, bicubic)
+        self.device.render_variant(state.id, bicubic, class)
     }
 
     fn mesh_pipeline(

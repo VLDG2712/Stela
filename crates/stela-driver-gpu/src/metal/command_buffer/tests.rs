@@ -72,6 +72,8 @@ struct MockResolver {
     layouts: Vec<GeneratedLayoutKey>,
     /// The bicubic samplers of each render variant asked for.
     bicubic: Vec<[u32; 2]>,
+    /// The topology class of each variant bound.
+    topology_classes: Vec<PrimitiveTopologyClass>,
 }
 
 impl ChunkSource for MockResolver {
@@ -113,9 +115,13 @@ impl Resolver for MockResolver {
         &mut self,
         _: &RenderPipelineState,
         bicubic: [u32; 2],
+        class: PrimitiveTopologyClass,
     ) -> Result<Pipeline> {
         self.bicubic.push(bicubic);
-        Ok(Pipeline(800 + u64::from(bicubic[0] | bicubic[1] << 16)))
+        self.topology_classes.push(class);
+        Ok(Pipeline(
+            800 + u64::from(bicubic[0] | bicubic[1] << 16) + (class.raw() << 40),
+        ))
     }
 
     fn mesh_pipeline(
@@ -864,6 +870,65 @@ fn draws_bind_no_variant_for_samplers_their_pipeline_filters_bicubically() {
         .draw_primitives(&mut resolver, PrimitiveType::Triangle, 0, 3, 1, 0)
         .unwrap();
     assert!(resolver.bicubic.is_empty());
+}
+
+/// A pipeline without an input primitive topology on a device that fixes
+/// each pipeline's topology class draws triangles itself, and points and
+/// lines through a variant built for their class.
+#[test]
+fn points_and_lines_of_fixed_class_pipelines_bind_their_class_variant() {
+    let color = texture(PixelFormat::Rgba8Unorm);
+    let draws = [
+        PrimitiveType::Point,
+        PrimitiveType::Triangle,
+        PrimitiveType::LineStrip,
+        PrimitiveType::Line,
+        PrimitiveType::TriangleStrip,
+    ];
+    for variants in [true, false] {
+        let mut resolver = MockResolver::default();
+        let mut commands = CommandBuffer::new(FEATURES);
+        commands
+            .begin_render(
+                &mut resolver,
+                pass(&color, StoreAction::Store, false),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut state = render_state(1);
+        state.plan.topology_class = PrimitiveTopologyClass::Unspecified;
+        state.plan.topology_variants = variants;
+        commands.set_render_pipeline_state(&state).unwrap();
+        commands
+            .set_render_buffer(Stage::Vertex, Some(buffer(3, 256)), 0, 2)
+            .unwrap();
+        for primitive in draws {
+            commands
+                .draw_primitives(&mut resolver, primitive, 0, 3, 1, 0)
+                .unwrap();
+        }
+        commands.end_encoding(&mut resolver).unwrap();
+        let recording = commit(commands, &mut resolver, (Semaphore(1), 1));
+        let pipelines: Vec<Pipeline> = recording.segments[0]
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::BindPipeline { pipeline, .. } => Some(*pipeline),
+                _ => None,
+            })
+            .collect();
+        let variant = |class: PrimitiveTopologyClass| Pipeline(800 + (class.raw() << 40));
+        if variants {
+            use PrimitiveTopologyClass::{Line, Point};
+            assert_eq!(resolver.topology_classes, [Point, Line, Line]);
+            let own = Pipeline(42);
+            assert_eq!(pipelines, [own, variant(Point), own, variant(Line), own]);
+        } else {
+            assert!(resolver.topology_classes.is_empty());
+            assert_eq!(pipelines, [Pipeline(42)]);
+        }
+    }
 }
 
 /// A pipeline made before its process's first bicubic or pixel-coordinate

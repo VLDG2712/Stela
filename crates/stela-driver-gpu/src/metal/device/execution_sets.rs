@@ -60,7 +60,7 @@ impl ClassKey {
             .find(|interface| interface.stage == Stage::Fragment);
         Self {
             info,
-            topology: plan.topology_class,
+            topology: plan.indirect_topology(),
             patches: plan.tessellation.as_ref().map(|tessellation| {
                 match tessellation.control_point_index {
                     TessellationControlPointIndexType::None => RecordLayout::DRAW_PATCHES,

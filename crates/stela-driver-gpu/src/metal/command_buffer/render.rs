@@ -2276,7 +2276,14 @@ impl CommandBuffer {
             "the primitive type is outside the pipeline's topology class",
         )?;
         self.bindings.require_buffers(&pipeline.interfaces)?;
-        self.bind_bicubic(resolver)?;
+        // A pipeline that draws triangles alone takes a variant for points
+        // and lines.
+        let variant = match primitive.class() {
+            PrimitiveTopologyClass::Triangle => PrimitiveTopologyClass::Unspecified,
+            class if pipeline.plan.topology_variants => class,
+            _ => PrimitiveTopologyClass::Unspecified,
+        };
+        self.bind_bicubic(resolver, variant)?;
         let render = self::render(&mut self.encoder)?;
         let pipeline = render
             .pipeline
@@ -2420,7 +2427,7 @@ impl CommandBuffer {
             index_bytes.is_some() == source.control_point_indices.is_some(),
             "indexed patch draws match the pipeline's control point index type",
         )?;
-        self.bind_bicubic(resolver)?;
+        self.bind_bicubic(resolver, PrimitiveTopologyClass::Unspecified)?;
         let render = self::render(&mut self.encoder)?;
         let pipeline = render
             .pipeline
@@ -2494,9 +2501,14 @@ impl CommandBuffer {
     }
 
     /// Binds the variant of the vertex pipeline whose stages filter the
-    /// bicubic samplers the draw binds them bicubically, or the pipeline
-    /// itself when it does.
-    fn bind_bicubic(&mut self, resolver: &mut dyn Resolver) -> Result<()> {
+    /// bicubic samplers the draw binds them bicubically, built for
+    /// primitives of `class` unless it is `Unspecified`, or the pipeline
+    /// itself when it does both.
+    fn bind_bicubic(
+        &mut self,
+        resolver: &mut dyn Resolver,
+        class: PrimitiveTopologyClass,
+    ) -> Result<()> {
         let render = render(&mut self.encoder)?;
         let Some(state) = render.pipeline.as_ref() else {
             return Ok(());
@@ -2509,12 +2521,15 @@ impl CommandBuffer {
             };
             bicubic[stage] |= self.bindings.bicubic_samplers(interface.stage, interface);
         }
-        let pipeline =
-            if !state.outdated && (0..2).all(|stage| bicubic[stage] & !state.bicubic[stage] == 0) {
-                state.pipeline
-            } else {
-                Some(resolver.bicubic_render_pipeline(state, bicubic)?)
-            };
+        let own = class == PrimitiveTopologyClass::Unspecified;
+        let pipeline = if own
+            && !state.outdated
+            && (0..2).all(|stage| bicubic[stage] & !state.bicubic[stage] == 0)
+        {
+            state.pipeline
+        } else {
+            Some(resolver.bicubic_render_pipeline(state, bicubic, class)?)
+        };
         if let Some(pipeline) = pipeline.filter(|&pipeline| render.bound != Some(pipeline)) {
             render.bound = Some(pipeline);
             self.recorder.push(Command::BindPipeline {

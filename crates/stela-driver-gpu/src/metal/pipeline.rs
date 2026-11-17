@@ -105,7 +105,9 @@ pub const fn stencil_op(operation: StencilOperation) -> StencilOp {
 }
 
 /// The pipeline topology for a Metal input class; draws set the exact
-/// topology dynamically (`dynamicPrimitiveTopologyUnrestricted`).
+/// topology of the class dynamically, and of another class too where the
+/// device has `dynamicPrimitiveTopologyUnrestricted`
+/// ([`RenderPipelinePlan::topology_variants`] where it has not).
 pub const fn class_topology(class: PrimitiveTopologyClass) -> PrimitiveTopology {
     match class {
         PrimitiveTopologyClass::Point => PrimitiveTopology::PointList,
@@ -447,6 +449,26 @@ pub struct RenderPipelinePlan {
     /// test no depth or stencil in the pipeline, and the pass's depth and
     /// stencil live in their copies while they draw.
     pub tests_fragments: bool,
+    /// Its Vulkan pipeline draws triangles alone: the device fixes a
+    /// pipeline's topology class (it lacks
+    /// `dynamicPrimitiveTopologyUnrestricted`) and the state has no input
+    /// primitive topology. Point and line draws bind a variant built for
+    /// their class ([`Resolver::bicubic_render_pipeline`]).
+    ///
+    /// [`Resolver::bicubic_render_pipeline`]: super::command_buffer::Resolver::bicubic_render_pipeline
+    pub topology_variants: bool,
+}
+
+impl RenderPipelinePlan {
+    /// The topology class of the primitives GPU-resident commands draw
+    /// with it, which bind no variants: triangles alone for a pipeline of
+    /// topology variants.
+    pub fn indirect_topology(&self) -> PrimitiveTopologyClass {
+        match self.topology_variants {
+            true => PrimitiveTopologyClass::Triangle,
+            false => self.topology_class,
+        }
+    }
 }
 
 pub fn render_pipeline(
@@ -938,6 +960,7 @@ fn targets(
         mesh: None,
         tessellation: None,
         tests_fragments,
+        topology_variants: false,
     })
 }
 

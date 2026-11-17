@@ -529,7 +529,7 @@ impl CommandBuffer {
                 .iter()
                 .fold(ShaderStages::EMPTY, |stages, &(stage, _)| stages | stage),
             rasterization: plan.rasterization_enabled,
-            topology: plan.topology_class,
+            topology: plan.indirect_topology(),
             patches,
             vertex_buffers: plan
                 .info

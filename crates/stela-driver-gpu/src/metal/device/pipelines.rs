@@ -283,9 +283,11 @@ struct RenderObject {
     /// A vertex pipeline's request, which its bicubic variants compile.
     request: Option<RenderPipelineRequest>,
     /// Variants whose vertex and fragment stages filter the samplers at
-    /// these indices bicubically ([`RenderPipelineState::bicubic`]), and
-    /// whether their process had made such samplers when they compiled.
-    bicubic: Vec<([u32; 2], bool, Pipeline)>,
+    /// these indices bicubically ([`RenderPipelineState::bicubic`]), built
+    /// for primitives of a topology class (`Unspecified` for the state's
+    /// own, [`RenderPipelinePlan::topology_variants`]), and whether their
+    /// process had made such samplers when they compiled.
+    bicubic: Vec<([u32; 2], PrimitiveTopologyClass, bool, Pipeline)>,
 }
 
 /// The object and mesh functions of a mesh pipeline, which its variants
@@ -1271,8 +1273,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         } else {
             [0; 2]
         };
-        let (vulkan, plan, interfaces) =
-            self.create_render(request, linkings, &sources, bicubic, indirect_bindable)?;
+        let (vulkan, plan, interfaces) = self.create_render(
+            request,
+            linkings,
+            &sources,
+            bicubic,
+            indirect_bindable,
+            PrimitiveTopologyClass::Unspecified,
+        )?;
+        if plan.topology_variants && plan.info.indirect_bindable {
+            // GPU-resident commands bind no variants: such a pipeline's
+            // point and line draws there draw nothing.
+            self.unsupported(
+                "GPU-resident point and line draws of render pipelines without an input \
+                 primitive topology on a device that fixes each pipeline's topology class",
+            );
+        }
         self.tests_fragments |= plan.tests_fragments;
         let indirect = if plan.info.indirect_bindable {
             match self.add_indirect_render(&plan, &interfaces, vulkan) {
@@ -1332,6 +1348,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         sources: &Sources,
         [vertex_bicubic, fragment_bicubic]: [u32; 2],
         indirect_bindable: bool,
+        class: PrimitiveTopologyClass,
     ) -> Result<(Pipeline, RenderPipelinePlan, Vec<Interface>)> {
         let pipelines = &self.pipelines;
         let function = pipelines.interface(request.vertex_function)?;
@@ -1411,7 +1428,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             fragment_function: fragment.as_ref(),
             vertex_descriptor: request.vertex_descriptor.as_ref(),
             targets: request.targets,
-            input_primitive_topology: request.input_primitive_topology,
+            input_primitive_topology: match class {
+                PrimitiveTopologyClass::Unspecified => request.input_primitive_topology,
+                class => class,
+            },
             max_vertex_amplification_count: request.max_vertex_amplification_count,
             tessellation: tessellation.as_ref().zip(feeding).map(
                 |(tessellation, [vertex, control])| TessellatedVertex {
@@ -1421,12 +1441,20 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 },
             ),
         };
+        let fixed_class = !self
+            .backend
+            .physical_device()
+            .features
+            .dynamic_primitive_topology_unrestricted;
         // The driver compiles the NIR into the pipeline, which outlives it.
         let start = self.timing.now();
         let created =
             pipeline::render_pipeline(&self.capabilities, &descriptor).and_then(|mut plan| {
                 let start = self.timing.since(Phase::PipelinePlan, start);
                 plan.info.indirect_bindable = indirect_bindable;
+                plan.topology_variants = fixed_class
+                    && plan.tessellation.is_none()
+                    && descriptor.input_primitive_topology == PrimitiveTopologyClass::Unspecified;
                 let pipeline = self.create_from(sources, |backend, source| {
                     plan.info.source = source;
                     backend.create_graphics_pipeline(&plan.info)
@@ -1587,10 +1615,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The vertex pipeline whose vertex and fragment stages filter the
     /// samplers at `bicubic` bicubically, for draws binding bicubic samplers
     /// there; compiled on first use.
-    pub(super) fn render_variant(&mut self, id: u64, bicubic: [u32; 2]) -> Result<Pipeline> {
+    pub(super) fn render_variant(
+        &mut self,
+        id: u64,
+        bicubic: [u32; 2],
+        class: PrimitiveTopologyClass,
+    ) -> Result<Pipeline> {
         let index = u32::try_from(id).map_err(|_| Error::Invalid("unknown pipeline"))?;
         let render = self.pipelines.render.get(index)?;
+        // Only a pipeline of topology variants builds one for a class.
+        let class = match render.state.plan.topology_variants {
+            true => class,
+            false => PrimitiveTopologyClass::Unspecified,
+        };
         if bicubic == render.state.bicubic
+            && class == PrimitiveTopologyClass::Unspecified
             && !render.state.outdated
             && let Some(pipeline) = render.state.pipeline
         {
@@ -1601,10 +1640,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .clone()
             .ok_or(Error::Invalid("not a vertex pipeline"))?;
         let arguments = self.admitted(request.vertex_function)?;
-        if let Some((_, _, pipeline)) = render
-            .bicubic
-            .iter()
-            .find(|(known, admitted, _)| *known == bicubic && *admitted == arguments)
+        if let Some((_, _, _, pipeline)) =
+            render
+                .bicubic
+                .iter()
+                .find(|(known, known_class, admitted, _)| {
+                    *known == bicubic && *known_class == class && *admitted == arguments
+                })
         {
             return Ok(*pipeline);
         }
@@ -1621,12 +1663,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             &Sources::default(),
             bicubic,
             false,
+            class,
         )?;
         self.pipelines
             .render
             .get_mut(index)?
             .bicubic
-            .push((bicubic, arguments, pipeline));
+            .push((bicubic, class, arguments, pipeline));
         Ok(pipeline)
     }
 
@@ -1744,7 +1787,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             (_, pipeline) => pipeline,
         };
         let variants = render.variants.into_iter().map(|(_, _, pipeline)| pipeline);
-        let bicubic = render.bicubic.into_iter().map(|(_, _, pipeline)| pipeline);
+        let bicubic = render
+            .bicubic
+            .into_iter()
+            .map(|(_, _, _, pipeline)| pipeline);
         for pipeline in pipeline.into_iter().chain(variants).chain(bicubic) {
             self.defer(Object::Pipeline(pipeline));
         }
