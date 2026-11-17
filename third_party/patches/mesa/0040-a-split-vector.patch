@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:52:38 +0000
+Subject: [PATCH] aco: a split vector turned into a copy releases the operands
+ of each instruction only its vector used, where they kept a use after the
+ instruction was removed and ACO's validation aborted on GFX8 and GFX9
+
+---
+ src/amd/compiler/aco_optimizer.cpp | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/compiler/aco_optimizer.cpp b/src/amd/compiler/aco_optimizer.cpp
+index 225946106f660b7c459d01fce281a8384a1522b7..584a9f2845fdaf9b60f5cd42b76af8dbb521b97a 100644
+--- a/src/amd/compiler/aco_optimizer.cpp
++++ b/src/amd/compiler/aco_optimizer.cpp
+@@ -4930,13 +4930,13 @@ select_instruction(opt_ctx& ctx, aco_ptr<Instruction>& instr)
+             off += vec_op.bytes();
+          }
+          if (off != instr->operands[0].bytes() && op.bytes() == instr->definitions[idx].bytes()) {
+-            ctx.uses[instr->operands[0].tempId()]--;
+-            for (Operand& vec_op : vec->operands) {
+-               if (vec_op.isTemp())
+-                  ctx.uses[vec_op.tempId()]--;
+-            }
++            /* The copy keeps op. The vector dies, and so does each instruction only it used,
++             * which must release its own operands, or their uses stay counted after it is
++             * removed.
++             */
+             if (op.isTemp())
+                ctx.uses[op.tempId()]++;
++            decrease_and_dce(ctx, instr->operands[0].getTemp());
+ 
+             aco_ptr<Instruction> copy{
+                create_instruction(aco_opcode::p_parallelcopy, Format::PSEUDO, 1, 1)};
